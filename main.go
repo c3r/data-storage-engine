@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -11,26 +12,32 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/tjarratt/babble"
 )
 
 var index_map_key_order = []string{}
-var index_map = map[string]string{}
+var index_map = map[string]IndexItem{}
 var persisted_segments_num = 0
+var write_offset uint64 = 0
 
-const MAP_REFERENCE_MAX_SIZE = 10
-const TEST_SIZE = 100
+const MAP_REFERENCE_MAX_SIZE = 100
+const TEST_SIZE = 1000
+const FILE_PATH = "/tmp/dat2"
 
 // var cmd = "write"
 
-type SortedSegment struct {
-	size  int
-	key   string
-	value string
+type Segment struct {
+	Size  uint64
+	Key   string
+	Value string
+}
+
+type IndexItem struct {
+	Offset uint64
+	Size   uint64
 }
 
 func main() {
-
-	// rand.Seed(time.Now().UnixNano())
 
 	// TODO: here - check how many persisted segments there are on disk at start
 	// persisted_segments_num = ???
@@ -40,146 +47,226 @@ func main() {
 
 	var saved_keys []string
 
+	// save data
+	babbler := babble.NewBabbler()
 	for i := 0; i < TEST_SIZE; i++ {
 		saved_key := uuid.New().String()
-		RunCommand("write", saved_key, uuid.New().String())
+		RunCommand("write", saved_key, babbler.Babble())
 		saved_keys = append(saved_keys, saved_key)
 	}
 
-	for i := 0; i < TEST_SIZE; i++ {
+	// read data
+	for i := TEST_SIZE - 1; i > 0; i-- {
 		saved_key := saved_keys[i]
 		RunCommand("read", saved_key, "")
 	}
-
-	// RunCommand("write", "a", "value_for_a")
-	// RunCommand("write", "b", "value_for_b")
-	// RunCommand("write", "c", "value_for_c")
-	// RunCommand("write", "d", "value_for_d")
-	// RunCommand("read", "a", "")
-	// RunCommand("read", "b", "")
-	// RunCommand("read", "c", "")
-	// RunCommand("read", "d", "")
 }
 
 func RunCommand(cmd string, key string, value string) {
 	switch cmd {
 	case "write":
-		Write(key, value)
-		Persist()
+
+		// write value to disk
+		Debug2("Writing to disk: [%s] | [%s]", key, value)
+		offset, bytes_written := Write(key, value)
+
+		// update index map with index key and offset on disk
+		var index_item IndexItem
+		index_item.Offset = offset
+		index_item.Size = bytes_written
+		index_map[key] = index_item
+		index_map_key_order = append(index_map_key_order, key)
+		write_offset = write_offset + bytes_written
+
+		// if the key order is not sorted, sort the order
+		if !slices.IsSorted(index_map_key_order) {
+			slices.Sort(index_map_key_order)
+		}
+
+		if len(index_map) > MAP_REFERENCE_MAX_SIZE {
+			Debug0("MAP_REFERENCE_MAX_SIZE passed. Persisting index map to a new segment file...")
+			PersistIndexMap()
+		}
+
 	case "read":
-		ret_value, value_exists := Read(key)
+		segment, value_exists := Read(key)
 		if value_exists {
-			Debug("Value for key [%s] = [%s]", key, ret_value)
+			Debug2("Read from disk: [%s] | [%s]", segment.Key, segment.Value)
 		} else {
-			Debug("No value for key [%s]", key, "")
+			msg := fmt.Sprintf("No segment for key [%s] found!", key)
+			panic(msg)
 		}
 	}
 }
 
-func Debug(format string, val1 string, val2 string) {
+func Debug0(format string) {
+	Debug(format, "", "", "")
+}
+
+func Debug1(format string, value string) {
+	Debug(format, value, "", "")
+}
+
+func Debug2(format string, value1 string, value2 string) {
+	Debug(format, value1, value2, "")
+}
+
+func Debug3(format string, value1 string, value2 string, value3 string) {
+	Debug(format, value1, value2, value3)
+}
+
+func Debug(format string, value1 string, value2 string, value3 string) {
 	now := time.Now().Format(time.StampNano)
 	format = "[DEBUG] " + now + ": " + format + "\n"
 
-	if val1 == "" && val2 == "" {
-		fmt.Printf(format)
-	} else if val2 == "" {
-		fmt.Printf(format, val1)
-	} else {
-		fmt.Printf(format, val1, val2)
-	}
-}
-
-func Write(key string, value string) {
-	index_map[key] = value
-	index_map_key_order = append(index_map_key_order, key)
-	// Debug("Writing value [%s] for key [%s] done.", value, key)
-	if !slices.IsSorted(index_map_key_order) {
-		Debug("Sorting index...", "", "")
-		slices.Sort(index_map_key_order)
-		Debug("Sorting index done.", "", "")
-	}
-}
-
-func Persist() {
-	if len(index_map) < MAP_REFERENCE_MAX_SIZE {
+	if value1 == "" && value2 == "" && value3 == "" {
+		fmt.Print(format)
 		return
 	}
-	Debug("MAP_REFERENCE_MAX_SIZE passed. Persisting index map to a new segment file...", "", "")
 
-	file, err := os.Create("/tmp/dat2")
-	if err != nil {
+	if value1 != "" && value2 == "" && value3 == "" {
+		fmt.Printf(format, value1)
+		return
+	}
+
+	if value1 != "" && value2 != "" && value3 == "" {
+		fmt.Printf(format, value1, value2)
+		return
+	}
+
+	if value1 != "" && value2 != "" && value3 != "" {
+		fmt.Printf(format, value1, value2, value3)
+		return
+	}
+
+}
+
+func Write(key string, value string) (uint64, uint64) {
+	// ------ Open file from disk to write:
+	var file *os.File
+	if _, err := os.Stat(FILE_PATH); err == nil {
+		file, err = os.OpenFile(FILE_PATH, os.O_WRONLY, 0666)
+		if err != nil {
+			panic(err)
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		Debug1("File [%s] does not exist, creating...", FILE_PATH)
+		file, err = os.Create(FILE_PATH)
+		if err != nil {
+			panic(err)
+		}
+	} else {
 		panic(err)
 	}
 
-	for key, value := range index_map {
-		var segment = new(SortedSegment)
-		// segment.size = ???
-		segment.key = key
-		segment.value = value
-		file.Write()
+	// ------ Create data segment:
+	segment := new(Segment)
+	segment.Key = key
+	segment.Value = value
+
+	// ------ Encode:
+	bytes_buffer := bytes.Buffer{}
+	gob_encoder := gob.NewEncoder(&bytes_buffer)
+	err := gob_encoder.Encode(segment)
+	if err != nil {
+		Debug1("Error: %s", err.Error())
+		Debug1("Failed to encode segment for key %s", segment.Key)
+	}
+	encoded_segment := base64.StdEncoding.EncodeToString(bytes_buffer.Bytes())
+
+	encoded_segment_bytes := []byte(encoded_segment)
+
+	// ------ Write to disk:
+	bytes_written, err := file.WriteAt(encoded_segment_bytes, int64(write_offset))
+	// Debug3("[%s] bytes written to file [%s] at offset [%s]", strconv.Itoa(bytes_written), file.Name(), strconv.Itoa(int(write_offset)))
+
+	if err != nil {
+		panic(err)
 	}
 
 	file.Sync()
 	file.Close()
 
+	return write_offset, uint64(bytes_written)
+}
+
+func PersistIndexMap() {
+
 	// When the memtable gets bigger than some threshold—typically a few megabytes—write it out to disk as an SSTable file.
 	// This can be done efficiently because the tree already maintains the key-value pairs sorted by key.
 	// The new SSTable file becomes the most recent segment of the database.
 	// !!!: While the SSTable is being written out to disk, writes can continue to a new memtable instance.
-	Debug("Persisting index map to a new segment file done.", "", "")
+	Debug0("Persisting index map to a new segment file done.")
 }
 
-func ToGOB64(m SortedSegment) string {
-	b := bytes.Buffer{}
-	e := gob.NewEncoder(&b)
-	err := e.Encode(m)
-	if err != nil {
-		fmt.Println(`failed gob Encode`, err)
-	}
-	return base64.StdEncoding.EncodeToString(b.Bytes())
-}
-
-// go binary decoder
-func FromGOB64(str string) SortedSegment {
-	m := SortedSegment{}
-	by, err := base64.StdEncoding.DecodeString(str)
-	if err != nil {
-		fmt.Println(`failed base64 Decode`, err)
-	}
-	b := bytes.Buffer{}
-	b.Write(by)
-	d := gob.NewDecoder(&b)
-	err = d.Decode(&m)
-	if err != nil {
-		fmt.Println(`failed gob Decode`, err)
-	}
-	return m
-}
-
-func Read(key string) (string, bool) {
+func Read(key string) (*Segment, bool) {
 	// In order to serve a read request, first try to find the key in the memtable,
-	Debug("Searching for value for key [%s]...", key, "")
-	ret_value, value_exists := index_map[key]
+	index_item, value_exists := index_map[key]
 	if value_exists {
-		Debug("Value for key [%s] found in memtable, returning.", key, "")
-		return ret_value, true
-	}
-	Debug("Value for key [%s] not found in memtable, searching in persisted segments...", key, "")
-	// then in the persisted segment files
-	for segment_idx := 0; segment_idx < persisted_segments_num; segment_idx++ {
-		Debug("Searching for key [%s] in persisted segment [%s]...", key, strconv.Itoa(segment_idx))
-		ret_value, value_exists = ReadSegment(segment_idx, key)
-		if value_exists {
-			Debug("Value for key [%s] found in segment [%s], returning.", key, strconv.Itoa(segment_idx))
-			return ret_value, true
+
+		// ------ Open file from disk to read:
+		var file *os.File
+		if _, err := os.Stat(FILE_PATH); err == nil {
+			file, err = os.Open(FILE_PATH)
+			if err != nil {
+				panic(err)
+			}
+		} else if errors.Is(err, os.ErrNotExist) {
+			Debug1("File [%s] does not exist, creating...", FILE_PATH)
+			panic(err)
+		} else {
+			panic(err)
 		}
+
+		// ------ Read from disk into byte buffer
+		bytes_buff := make([]byte, index_item.Size)
+
+		_, err := file.ReadAt(bytes_buff, int64(index_item.Offset))
+		if err != nil {
+			Debug1("Error while reading value for key [%s]", key)
+			panic(err)
+		}
+
+		// ------ Create a segment
+		segment := Segment{}
+
+		// ------ Decode value which was read from the disk
+		string_bytes, err := base64.StdEncoding.DecodeString(string(bytes_buff))
+		if err != nil {
+			Debug1("Error while decoding bsae64 value for key [%s]", key)
+			panic(err)
+		}
+		var bytes_buffer bytes.Buffer
+		bytes_buffer.Write(string_bytes)
+		decoder := gob.NewDecoder(&bytes_buffer)
+		err = decoder.Decode(&segment)
+		if err != nil {
+			Debug1("Error while decoding gob value for key [%s]", key)
+			panic(err)
+		}
+
+		return &segment, true
 	}
-	Debug("Value for key [%s] not found in persisted segments, returning empty value.", key, "")
-	return "", false
+
+	Debug1("Value does not exist for key [%s]", key)
+	return new(Segment), false
 }
+
+// Debug1("Value for key [%s] not found in memtable, searching in persisted segments...", key)
+// // then in the persisted segment files
+// for segment_idx := 0; segment_idx < persisted_segments_num; segment_idx++ {
+// 	Debug2("Searching for key [%s] in persisted segment [%s]...", key, strconv.Itoa(segment_idx))
+// 	ret_value, value_exists = ReadSegment(segment_idx, key)
+// 	if value_exists {
+// 		Debug2("Value for key [%s] found in segment [%s], returning.", key, strconv.Itoa(segment_idx))
+// 		return ret_value, true
+// 	}
+// }
+// Debug1("Value for key [%s] not found in persisted segments, returning empty value.", key)
+// return "", false
 
 func ReadSegment(segment_idx int, key string) (string, bool) {
-	Debug("Reading from segment [%s]...", strconv.Itoa(segment_idx), "")
+	Debug1("Reading from segment [%s]...", strconv.Itoa(segment_idx))
 	return "from_read_segment", true
 }
 
