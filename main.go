@@ -8,125 +8,174 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"time"
-
-	"github.com/google/uuid"
-	"github.com/tjarratt/babble"
 )
 
-var indexMapKeyOrder = []string{}
-var indexMap = map[string]IndexItem{}
-var writeOffset uint64 = 0
+const FilePathTemplate = "/tmp/tb_storage_%d"
+const MemtableMaxSize = 2
 
-const MapReferenceMaxSize = 100
-const TestSize = 100000
-const FilePathToData = "/tmp/dat2"
-
-type KeyValueRow struct {
-	Size  uint64
-	Key   string
-	Value string
-}
-
-type IndexItem struct {
+type SegmentIndexItem struct {
 	Offset uint64
 	Size   uint64
 }
 
+type SegmentIndex struct {
+	Id    int
+	Index map[string]*SegmentIndexItem
+}
+
+type PersistentRow struct {
+	Key   string
+	Value string
+}
+
+var memtableOrder []string
+var memtable = map[string]string{}
+var segmentIndexes []*SegmentIndex
+
 func main() {
-	var testData = map[string]string{}
-	babbler := babble.NewBabbler()
+	//babbler := babble.NewBabbler()
+	//txt1 := babbler.Babble()
 
-	for i := 0; i < TestSize; i++ {
-		savedKey := uuid.New().String()
-		savedValue := babbler.Babble()
-		testData[savedKey] = savedValue
-	}
+	SaveKeyValueRow("1", "a")
+	SaveKeyValueRow("2", "b")
+	SaveKeyValueRow("3", "c")
+	SaveKeyValueRow("4", "d")
+	SaveKeyValueRow("5", "e")
+	SaveKeyValueRow("6", "f")
+	SaveKeyValueRow("7", "g")
+	SaveKeyValueRow("8", "h")
+	SaveKeyValueRow("9", "i")
+	SaveKeyValueRow("10", "j")
 
-	for savedKey, savedValue := range testData {
-		err := SaveKeyValueRow(savedKey, savedValue)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	for savedKey, _ := range testData {
-		retrievedValue, err := RetrieveValueForKey(savedKey)
-		if err != nil {
-			panic(err)
-		}
-		if retrievedValue != testData[savedKey] {
-			panic("wrong retrieved_value!")
-		}
-	}
+	RetrieveValueForKey("1")
+	RetrieveValueForKey("2")
+	RetrieveValueForKey("3")
+	RetrieveValueForKey("4")
+	RetrieveValueForKey("5")
+	RetrieveValueForKey("6")
+	RetrieveValueForKey("7")
+	RetrieveValueForKey("8")
+	RetrieveValueForKey("9")
+	RetrieveValueForKey("10")
 
 }
 
 func SaveKeyValueRow(key string, value string) error {
-	offset, bytesWritten, err := persist(key, value)
-	if err != nil {
-		return err
+	// If the memtable is still small enough, keep saving into memory
+	// Otherwise, save the memtable to disk while keeping saving to memory
+	if len(memtable) == MemtableMaxSize {
+		segmentNum := len(segmentIndexes)
+		Debug("Saving memtable to disk as segment %s...", strconv.Itoa(segmentNum))
+		Debug("Memtable to be saved: %s", fmt.Sprint(memtable))
+		var writeOffset int64 = 0
+		var segmentIndex SegmentIndex
+		segmentIndex.Index = make(map[string]*SegmentIndexItem)
+		for _, key := range memtableOrder { // In order!!!
+			value = memtable[key]
+
+			row := new(PersistentRow)
+			row.Key = key
+			row.Value = value
+
+			bytesWritten, err := persistRow(row, segmentNum, writeOffset)
+			if err != nil {
+				return err
+			}
+
+			var indexItem SegmentIndexItem
+			indexItem.Offset = uint64(writeOffset)
+			indexItem.Size = bytesWritten
+			segmentIndex.Index[key] = &indexItem
+			writeOffset += int64(bytesWritten)
+		}
+
+		segmentIndexes = append(segmentIndexes, &segmentIndex)
+
+		for idx := range segmentIndexes {
+			Debug("Segment indexes: %s", fmt.Sprint(segmentIndexes[idx]))
+		}
+
+		// Reset memtable
+		memtable = make(map[string]string)
+		memtableOrder = nil
 	}
 
-	// Update index
-	var indexItem IndexItem
-	indexItem.Offset = offset
-	indexItem.Size = bytesWritten
-	indexMap[key] = indexItem
-	indexMapKeyOrder = append(indexMapKeyOrder, key)
-	writeOffset = writeOffset + bytesWritten
-
-	// Sort if necessary
-	if !slices.IsSorted(indexMapKeyOrder) {
-		slices.Sort(indexMapKeyOrder)
-	}
+	memtable[key] = value
+	memtableOrder = append(memtableOrder, key)
+	slices.Sort(memtableOrder)
 
 	return nil
 }
 
 func RetrieveValueForKey(key string) (string, error) {
-	indexItem, valueExists := indexMap[key]
-	if !valueExists {
-		return "", errors.New("key not found")
+	value, valueExists := memtable[key]
+	if valueExists {
+		return value, nil
 	}
 
-	segment, err := retrieve(indexItem.Offset, indexItem.Size)
-	if err != nil {
-		return "", err
+	// If value does not exist in memtable, search segmentIndexes
+	// When key is found in a segmentIndex, read the value from the segment file from disk
+	Debug("Value for key %s not found in memtable, searching in segments...", key)
+	for segmentNum, segmentIndex := range segmentIndexes {
+		//Debug("Searching in segment %s...", strconv.Itoa(segmentNum))
+		indexItem, valueExists := segmentIndex.Index[key]
+		if !valueExists {
+			continue
+		}
+		//Debug("Found in segment %s. Trying to retrieve from segment file...", strconv.Itoa(segmentNum))
+		row, err := retrieveRow(indexItem.Offset, indexItem.Size, segmentNum)
+		if err != nil {
+			return "", err
+		}
+		Debug("Value %s retrieved!", row.Value)
+		return row.Value, nil
 	}
 
-	return segment.Value, nil
+	return "", errors.New("key not found")
 }
+
+func getSegmentFilePath(segment int) string {
+	return fmt.Sprintf(FilePathTemplate, segment)
+}
+
+//func compactSegmentFile(segmentNum int) error {
+//	path := getSegmentFilePath(segmentNum)
+//	file, err := openFileToRead(path)
+//	if err != nil {
+//		return err
+//	}
+//
+//}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // DATA OPERATIONS
 // ---------------------------------------------------------------------------------------------------------------------
 
-func persist(key string, value string) (uint64, uint64, error) {
-	file, err := openFileToWrite(FilePathToData)
+func persistRow(row *PersistentRow, segmentNum int, writeOffset int64) (uint64, error) {
+	pathForSegmentFile := getSegmentFilePath(segmentNum)
+	file, err := openFileToWrite(pathForSegmentFile)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 
-	keyValueRow := new(KeyValueRow)
-	keyValueRow.Key = key
-	keyValueRow.Value = value
-
-	encodedBytes, err := encodeKeyValueRow(keyValueRow)
+	encodedBytes, err := encodeKeyValueRow(row)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 
-	bytesWritten, err := writeToFile(file, encodedBytes)
+	bytesWritten, err := writeToFile(file, encodedBytes, writeOffset)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 
-	return writeOffset, uint64(bytesWritten), nil
+	return uint64(bytesWritten), nil
 }
 
-func retrieve(offset uint64, size uint64) (*KeyValueRow, error) {
-	file, err := openFileToRead(FilePathToData)
+func retrieveRow(offset uint64, size uint64, segmentNum int) (*PersistentRow, error) {
+	pathForSegmentFile := getSegmentFilePath(segmentNum)
+	file, err := openFileToRead(pathForSegmentFile)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +197,7 @@ func retrieve(offset uint64, size uint64) (*KeyValueRow, error) {
 // DATA DECODING/ENCODING
 // ---------------------------------------------------------------------------------------------------------------------
 
-func encodeKeyValueRow(row *KeyValueRow) ([]byte, error) {
+func encodeKeyValueRow(row *PersistentRow) ([]byte, error) {
 	bytesBuffer := bytes.Buffer{}
 	gobEncoder := gob.NewEncoder(&bytesBuffer)
 
@@ -162,9 +211,9 @@ func encodeKeyValueRow(row *KeyValueRow) ([]byte, error) {
 	return encodedBytes, nil
 }
 
-func decodeKeyValueRow(bytesFromFile []byte) (*KeyValueRow, error) {
+func decodeKeyValueRow(bytesFromFile []byte) (*PersistentRow, error) {
 	var bytesBuffer bytes.Buffer
-	var keyValueRow KeyValueRow
+	var row PersistentRow
 
 	stringBytes, err := base64.StdEncoding.DecodeString(string(bytesFromFile))
 	if err != nil {
@@ -173,12 +222,12 @@ func decodeKeyValueRow(bytesFromFile []byte) (*KeyValueRow, error) {
 
 	bytesBuffer.Write(stringBytes)
 	decoder := gob.NewDecoder(&bytesBuffer)
-	err = decoder.Decode(&keyValueRow)
+	err = decoder.Decode(&row)
 	if err != nil {
 		return nil, err
 	}
 
-	return &keyValueRow, nil
+	return &row, nil
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -192,7 +241,7 @@ func openFileToWrite(filePath string) (*os.File, error) {
 			return nil, err
 		}
 	} else if errors.Is(err, os.ErrNotExist) {
-		Debug1("File [%s] does not exist, creating...", filePath)
+		Debug("File [%s] does not exist, creating...", filePath)
 		file, err = os.Create(filePath)
 		if err != nil {
 			return nil, err
@@ -227,8 +276,8 @@ func readFromFile(file *os.File, size uint64, offset uint64) ([]byte, error) {
 	return bytesBuffer, nil
 }
 
-func writeToFile(file *os.File, bytes []byte) (int, error) {
-	bytesWritten, err := file.WriteAt(bytes, int64(writeOffset))
+func writeToFile(file *os.File, bytes []byte, writeOffset int64) (int, error) {
+	bytesWritten, err := file.WriteAt(bytes, writeOffset)
 	if err != nil {
 		return 0, err
 	}
@@ -247,44 +296,8 @@ func writeToFile(file *os.File, bytes []byte) (int, error) {
 // DEBUG Functions
 // ---------------------------------------------------------------------------------------------------------------------
 
-func Debug0(format string) {
-	Debug(format, "", "", "")
-}
-
-func Debug1(format string, value string) {
-	Debug(format, value, "", "")
-}
-
-func Debug2(format string, value1 string, value2 string) {
-	Debug(format, value1, value2, "")
-}
-
-func Debug3(format string, value1 string, value2 string, value3 string) {
-	Debug(format, value1, value2, value3)
-}
-
-func Debug(format string, value1 string, value2 string, value3 string) {
+func Debug(format string, value1 string) {
 	now := time.Now().Format(time.StampNano)
 	format = "[DEBUG] " + now + ": " + format + "\n"
-
-	if value1 == "" && value2 == "" && value3 == "" {
-		fmt.Print(format)
-		return
-	}
-
-	if value1 != "" && value2 == "" && value3 == "" {
-		fmt.Printf(format, value1)
-		return
-	}
-
-	if value1 != "" && value2 != "" && value3 == "" {
-		fmt.Printf(format, value1, value2)
-		return
-	}
-
-	if value1 != "" && value2 != "" && value3 != "" {
-		fmt.Printf(format, value1, value2, value3)
-		return
-	}
-
+	fmt.Printf(format, value1)
 }
