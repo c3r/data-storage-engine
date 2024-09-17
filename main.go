@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"strconv"
 	"time"
 )
 
@@ -32,108 +31,113 @@ type PersistentRow struct {
 
 var memtableOrder []string
 var memtable = map[string]string{}
-var segmentIndexes []*SegmentIndex
+var indexes []*SegmentIndex
 
 func main() {
 	//babbler := babble.NewBabbler()
 	//txt1 := babbler.Babble()
 
-	SaveKeyValueRow("1", "a")
-	SaveKeyValueRow("2", "b")
-	SaveKeyValueRow("3", "c")
-	SaveKeyValueRow("4", "d")
-	SaveKeyValueRow("5", "e")
-	SaveKeyValueRow("6", "f")
-	SaveKeyValueRow("7", "g")
-	SaveKeyValueRow("8", "h")
-	SaveKeyValueRow("9", "i")
-	SaveKeyValueRow("10", "j")
+	Save("1", "a")
+	Save("2", "b")
+	Save("3", "c")
+	Save("4", "d")
+	Save("5", "e")
+	Save("6", "f")
+	Save("7", "g")
+	Save("8", "h")
+	Save("9", "i")
+	Save("10", "j")
 
-	RetrieveValueForKey("1")
-	RetrieveValueForKey("2")
-	RetrieveValueForKey("3")
-	RetrieveValueForKey("4")
-	RetrieveValueForKey("5")
-	RetrieveValueForKey("6")
-	RetrieveValueForKey("7")
-	RetrieveValueForKey("8")
-	RetrieveValueForKey("9")
-	RetrieveValueForKey("10")
+	Load("1")
+	Load("2")
+	Load("3")
+	Load("4")
+	Load("5")
+	Load("6")
+	Load("7")
+	Load("8")
+	Load("9")
+	Load("10")
 
 }
 
-func SaveKeyValueRow(key string, value string) error {
-	// If the memtable is still small enough, keep saving into memory
-	// Otherwise, save the memtable to disk while keeping saving to memory
+func Save(key string, value string) error {
 	if len(memtable) == MemtableMaxSize {
-		segmentNum := len(segmentIndexes)
-		Debug("Saving memtable to disk as segment %s...", strconv.Itoa(segmentNum))
-		Debug("Memtable to be saved: %s", fmt.Sprint(memtable))
-		var writeOffset int64 = 0
-		var segmentIndex SegmentIndex
-		segmentIndex.Index = make(map[string]*SegmentIndexItem)
-		for _, key := range memtableOrder { // In order!!!
-			value = memtable[key]
-
-			row := new(PersistentRow)
-			row.Key = key
-			row.Value = value
-
-			bytesWritten, err := persistRow(row, segmentNum, writeOffset)
-			if err != nil {
-				return err
-			}
-
-			var indexItem SegmentIndexItem
-			indexItem.Offset = uint64(writeOffset)
-			indexItem.Size = bytesWritten
-			segmentIndex.Index[key] = &indexItem
-			writeOffset += int64(bytesWritten)
+		segmentIndex := newSegmentIndex()
+		err := saveMemtableAsSegment(segmentIndex)
+		if err != nil {
+			return err
 		}
-
-		segmentIndexes = append(segmentIndexes, &segmentIndex)
-
-		for idx := range segmentIndexes {
-			Debug("Segment indexes: %s", fmt.Sprint(segmentIndexes[idx]))
-		}
-
-		// Reset memtable
 		memtable = make(map[string]string)
 		memtableOrder = nil
 	}
-
 	memtable[key] = value
 	memtableOrder = append(memtableOrder, key)
 	slices.Sort(memtableOrder)
-
 	return nil
 }
 
-func RetrieveValueForKey(key string) (string, error) {
+func Load(key string) (string, error) {
 	value, valueExists := memtable[key]
 	if valueExists {
 		return value, nil
 	}
-
-	// If value does not exist in memtable, search segmentIndexes
-	// When key is found in a segmentIndex, read the value from the segment file from disk
-	Debug("Value for key %s not found in memtable, searching in segments...", key)
-	for segmentNum, segmentIndex := range segmentIndexes {
-		//Debug("Searching in segment %s...", strconv.Itoa(segmentNum))
+	for segment := len(indexes) - 1; segment >= 0; segment-- {
+		segmentIndex := indexes[segment]
 		indexItem, valueExists := segmentIndex.Index[key]
 		if !valueExists {
 			continue
 		}
-		//Debug("Found in segment %s. Trying to retrieve from segment file...", strconv.Itoa(segmentNum))
-		row, err := retrieveRow(indexItem.Offset, indexItem.Size, segmentNum)
+		bytesFromFile, err := readSegment(indexItem.Offset, indexItem.Size, segment)
 		if err != nil {
 			return "", err
 		}
-		Debug("Value %s retrieved!", row.Value)
+		row, err := decode(bytesFromFile)
+		if err != nil {
+			return "", err
+		}
+		log(fmt.Sprintf("%s = %s", key, row.Value))
 		return row.Value, nil
 	}
-
+	log(fmt.Sprintf("Key [%s] not found!", key))
 	return "", errors.New("key not found")
+}
+
+func saveMemtableAsSegment(segmentIndex SegmentIndex) error {
+	var writeOffset uint64 = 0
+	for _, key := range memtableOrder {
+		value := memtable[key]
+		row := new(PersistentRow)
+		row.Key = key
+		row.Value = value
+		encodedBytes, err := encode(row)
+		if err != nil {
+			log(fmt.Sprintf("Error while encoding row with key = [%s]", row.Key))
+			return err
+		}
+		bytesWritten, err := writeSegment(encodedBytes, segmentIndex.Id, writeOffset)
+		if err != nil {
+			return err
+		}
+		segmentIndex.update(writeOffset, bytesWritten, key)
+		writeOffset += bytesWritten
+	}
+	return nil
+}
+
+func newSegmentIndex() SegmentIndex {
+	var index SegmentIndex
+	indexes = append(indexes, &index)
+	index.Index = make(map[string]*SegmentIndexItem)
+	index.Id = len(indexes) - 1
+	return index
+}
+
+func (index *SegmentIndex) update(writeOffset uint64, bytesWritten uint64, key string) {
+	var item SegmentIndexItem
+	item.Offset = writeOffset
+	item.Size = bytesWritten
+	index.Index[key] = &item
 }
 
 func getSegmentFilePath(segment int) string {
@@ -153,87 +157,72 @@ func getSegmentFilePath(segment int) string {
 // DATA OPERATIONS
 // ---------------------------------------------------------------------------------------------------------------------
 
-func persistRow(row *PersistentRow, segmentNum int, writeOffset int64) (uint64, error) {
-	pathForSegmentFile := getSegmentFilePath(segmentNum)
-	file, err := openFileToWrite(pathForSegmentFile)
+func writeSegment(encodedBytes []byte, segment int, writeOffset uint64) (uint64, error) {
+	path := getSegmentFilePath(segment)
+	file, err := openWrite(path)
 	if err != nil {
+		log(fmt.Sprintf("Error while opening file [%s] to write", path))
 		return 0, err
 	}
-
-	encodedBytes, err := encodeKeyValueRow(row)
+	bytesWritten, err := write(file, encodedBytes, writeOffset)
 	if err != nil {
+		log(fmt.Sprintf("Error while writing to file [%s]", path))
 		return 0, err
 	}
-
-	bytesWritten, err := writeToFile(file, encodedBytes, writeOffset)
-	if err != nil {
-		return 0, err
-	}
-
 	return uint64(bytesWritten), nil
 }
 
-func retrieveRow(offset uint64, size uint64, segmentNum int) (*PersistentRow, error) {
-	pathForSegmentFile := getSegmentFilePath(segmentNum)
-	file, err := openFileToRead(pathForSegmentFile)
+func readSegment(offset uint64, size uint64, segment int) ([]byte, error) {
+	path := getSegmentFilePath(segment)
+	file, err := openRead(path)
 	if err != nil {
+		log(fmt.Sprintf("Error while opening file [%s] to open", path))
 		return nil, err
 	}
-
-	bytesFromFile, err := readFromFile(file, size, offset)
+	bytesFromFile, err := read(file, size, offset)
 	if err != nil {
+		log(fmt.Sprintf("Error while reading file [%s]", path))
 		return nil, err
 	}
-
-	keyValueRow, err := decodeKeyValueRow(bytesFromFile)
-	if err != nil {
-		return nil, err
-	}
-
-	return keyValueRow, nil
+	return bytesFromFile, nil
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // DATA DECODING/ENCODING
 // ---------------------------------------------------------------------------------------------------------------------
 
-func encodeKeyValueRow(row *PersistentRow) ([]byte, error) {
+func encode(row *PersistentRow) ([]byte, error) {
 	bytesBuffer := bytes.Buffer{}
 	gobEncoder := gob.NewEncoder(&bytesBuffer)
-
 	err := gobEncoder.Encode(row)
 	if err != nil {
 		return nil, err
 	}
-
 	encodedRow := base64.StdEncoding.EncodeToString(bytesBuffer.Bytes())
 	encodedBytes := []byte(encodedRow)
 	return encodedBytes, nil
 }
 
-func decodeKeyValueRow(bytesFromFile []byte) (*PersistentRow, error) {
+func decode(bytesFromFile []byte) (*PersistentRow, error) {
 	var bytesBuffer bytes.Buffer
 	var row PersistentRow
-
 	stringBytes, err := base64.StdEncoding.DecodeString(string(bytesFromFile))
 	if err != nil {
 		return nil, err
 	}
-
 	bytesBuffer.Write(stringBytes)
 	decoder := gob.NewDecoder(&bytesBuffer)
 	err = decoder.Decode(&row)
 	if err != nil {
 		return nil, err
 	}
-
 	return &row, nil
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // FILES
 // ---------------------------------------------------------------------------------------------------------------------
-func openFileToWrite(filePath string) (*os.File, error) {
+func openWrite(filePath string) (*os.File, error) {
 	var file *os.File
 	if _, err := os.Stat(filePath); err == nil {
 		file, err = os.OpenFile(filePath, os.O_WRONLY, 0666)
@@ -241,7 +230,6 @@ func openFileToWrite(filePath string) (*os.File, error) {
 			return nil, err
 		}
 	} else if errors.Is(err, os.ErrNotExist) {
-		Debug("File [%s] does not exist, creating...", filePath)
 		file, err = os.Create(filePath)
 		if err != nil {
 			return nil, err
@@ -252,7 +240,7 @@ func openFileToWrite(filePath string) (*os.File, error) {
 	return file, nil
 }
 
-func openFileToRead(filePath string) (*os.File, error) {
+func openRead(filePath string) (*os.File, error) {
 	var file *os.File
 	if _, err := os.Stat(filePath); err == nil {
 		file, err = os.Open(filePath)
@@ -267,7 +255,7 @@ func openFileToRead(filePath string) (*os.File, error) {
 	return file, nil
 }
 
-func readFromFile(file *os.File, size uint64, offset uint64) ([]byte, error) {
+func read(file *os.File, size uint64, offset uint64) ([]byte, error) {
 	bytesBuffer := make([]byte, size)
 	_, err := file.ReadAt(bytesBuffer, int64(offset))
 	if err != nil {
@@ -276,8 +264,8 @@ func readFromFile(file *os.File, size uint64, offset uint64) ([]byte, error) {
 	return bytesBuffer, nil
 }
 
-func writeToFile(file *os.File, bytes []byte, writeOffset int64) (int, error) {
-	bytesWritten, err := file.WriteAt(bytes, writeOffset)
+func write(file *os.File, bytes []byte, writeOffset uint64) (int, error) {
+	bytesWritten, err := file.WriteAt(bytes, int64(writeOffset))
 	if err != nil {
 		return 0, err
 	}
@@ -296,8 +284,8 @@ func writeToFile(file *os.File, bytes []byte, writeOffset int64) (int, error) {
 // DEBUG Functions
 // ---------------------------------------------------------------------------------------------------------------------
 
-func Debug(format string, value1 string) {
+func log(format string) {
 	now := time.Now().Format(time.StampNano)
-	format = "[DEBUG] " + now + ": " + format + "\n"
-	fmt.Printf(format, value1)
+	format = now + ": " + format + "\n"
+	fmt.Printf(format)
 }
