@@ -1,13 +1,3 @@
-module tomek.com/data_storage
+module github.com/c3r/data-storage-engine
 
 go 1.23.1
-
-require (
-	github.com/google/uuid v1.6.0
-	github.com/tjarratt/babble v0.0.0-20210505082055-cbca2a4833c1
-)
-
-require (
-	github.com/onsi/ginkgo v1.16.5 // indirect
-	github.com/onsi/gomega v1.34.2 // indirect
-)
