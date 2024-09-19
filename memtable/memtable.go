@@ -1,38 +1,87 @@
 package memtable
 
-import "slices"
+import (
+	"slices"
+	"strconv"
+	"sync"
+	"sync/atomic"
+)
 
-func (memory *Memtable) init() {
-	memory.Active = true
-	memory.clear()
+type synchronizedKeyValueMap struct {
+	keyMap map[string]string
+	order  []string
+	mutex  sync.Mutex
 }
 
-func (memory *Memtable) isMaxSize() bool {
-	return len(memory.Map) == MemtableMaxSize
+type Memtable struct {
+	memtables map[string]*synchronizedKeyValueMap
+	Used      string
+	mutex     sync.Mutex
+	maxSize   int
+	Count     atomic.Uint64
 }
 
-func (memory *Memtable) put(key string, value string) {
-	memory.mutex.Lock()
-	memory.Map[key] = value
-	memory.Order = append(memory.Order, key)
-	slices.Sort(memory.Order)
-	memory.mutex.Unlock()
+func New(maxSize int) *Memtable {
+	tm := &Memtable{
+		memtables: make(map[string]*synchronizedKeyValueMap),
+		maxSize:   maxSize,
+		Count:     atomic.Uint64{},
+		Used:      "0",
+	}
+	tm.initNext()
+	return tm
 }
 
-func (memory *Memtable) get(key string) (string, bool) {
-	value, valueExists := memory.Map[key]
-	return value, valueExists
+func (tm *Memtable) Put(key string, value string) (string, bool) {
+	m := tm.memtables[tm.Used]
+	m.mutex.Lock()
+	m.keyMap[key] = value
+	m.order = append(m.order, key)
+	slices.Sort(m.order)
+	tm.mutex.Lock()
+	if len(m.keyMap) == tm.maxSize {
+		prev := tm.initNext()
+		tm.mutex.Unlock()
+		m.mutex.Unlock()
+		return prev, true
+	}
+	m.mutex.Unlock()
+	tm.mutex.Unlock()
+	return "", false
 }
 
-func (memory *Memtable) clear() {
-	memory.Map = make(map[string]string)
-	memory.Order = []string{}
+func (tm *Memtable) Get(key string) (string, bool) {
+	tm.mutex.Lock()
+	for _, memtable := range tm.memtables {
+		value, valueExists := memtable.keyMap[key]
+		if valueExists {
+			tm.mutex.Unlock()
+			return value, true
+		}
+	}
+	tm.mutex.Unlock()
+	return "", false
 }
 
-func (memory *Memtable) order() []string {
-	return memory.Order
+func (tm *Memtable) Clear(memtableKey string) {
+	tm.mutex.Lock()
+	delete(tm.memtables, memtableKey)
+	tm.mutex.Unlock()
 }
 
-func (memory *Memtable) table() map[string]string {
-	return memory.Map
+func (tm *Memtable) Dump(id string) ([]string, map[string]string) {
+	order := tm.memtables[id].order
+	table := tm.memtables[id].keyMap
+	return order, table
+}
+
+func (tm *Memtable) initNext() string {
+	tm.Count.Add(1)
+	prev := tm.Used
+	tm.Used = strconv.Itoa(int(tm.Count.Load()))
+	tm.memtables[tm.Used] = &synchronizedKeyValueMap{
+		keyMap: make(map[string]string),
+		order:  []string{},
+	}
+	return prev
 }

@@ -4,82 +4,93 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/gob"
+	"errors"
 	"fmt"
 
 	"github.com/c3r/data-storage-engine/files"
 )
 
-const FilePathTemplate = "/tmp/tb_storage_%d"
+const FilePathTemplate = "/tmp/tb_storage_%s"
 
-type SegmentIndexItem struct {
+type indexItem struct {
 	Offset uint64
 	Size   uint64
 }
 
-type Segment struct {
-	Id       int
+type segment struct {
+	Id       string
 	FilePath string
 	Offset   uint64
-	Index    map[string]*SegmentIndexItem
+	Index    map[string]*indexItem
 }
 
-type SegmentRow struct {
+type segmentRow struct {
 	Key   string
 	Value string
 }
 
 type SegmentTable struct {
-	segments []*Segment
+	segments []*segment
 }
 
-func (table *SegmentTable) Append(segment *Segment) {
-	table.segments = append(table.segments, segment)
-}
-
-func (table *SegmentTable) Length() int {
-	return len(table.segments)
-}
-
-func (table *SegmentTable) Get(key int) *Segment {
-	return table.segments[key]
-}
-
-func (seg *Segment) Write(id int, order []string, table map[string]string) error {
-	seg.Id = id
-	seg.Index = make(map[string]*SegmentIndexItem)
-	seg.FilePath = fmt.Sprintf(FilePathTemplate, id)
+func (st *SegmentTable) Create(id string, order []string, table map[string]string) error {
+	s := &segment{
+		Id:       id,
+		FilePath: fmt.Sprintf(FilePathTemplate, id),
+		Index:    make(map[string]*indexItem),
+	}
+	st.segments = append(st.segments, s)
 	for _, key := range order {
-		row := new(SegmentRow)
-		row.Key = key
-		row.Value = table[key]
-		bytes, err := encodeRow(row)
+		row := &segmentRow{
+			Key:   key,
+			Value: table[key],
+		}
+		bytes, err := encode(row)
 		if err != nil {
 			return err
 		}
-		file, err := files.OpenFileWrite(seg.FilePath)
+		file, err := files.OpenFileWrite(s.FilePath)
 		if err != nil {
 			return err
 		}
-		bytesWritten, err := files.Write(file, bytes, seg.Offset)
+		bytesWritten, err := files.Write(file, bytes, s.Offset)
 		if err != nil {
 			return err
 		}
 		// After saving to file, update segment in memory
-		var item SegmentIndexItem
-		item.Offset = seg.Offset
+		var item indexItem
+		item.Offset = s.Offset
 		item.Size = bytesWritten
-		seg.Index[key] = &item
-		seg.Offset += bytesWritten
+		s.Index[key] = &item
+		s.Offset += bytesWritten
 	}
 	return nil
 }
 
-func (seg *Segment) Read(key string) ([]byte, bool, error) {
-	item, valueExists := seg.Index[key]
+func (st *SegmentTable) Load(key string) (string, error) {
+	for _, s := range st.segments {
+		bytes, valueExists, err := s.read(key)
+		if err != nil {
+			return "", err
+		}
+		if valueExists {
+			row, err := decode(bytes)
+			if err != nil {
+				return "", err
+			}
+			return row.Value, nil
+		}
+	}
+	e := fmt.Errorf("key %s not found", key)
+	return "", errors.New(e.Error())
+}
+
+func (s *segment) read(key string) ([]byte, bool, error) {
+	item, valueExists := s.Index[key]
 	if !valueExists {
 		return nil, false, nil
 	}
-	file, err := files.OpenFileRead(seg.FilePath)
+	file, err := files.OpenFileRead(s.FilePath)
 	if err != nil {
 		return nil, false, err
 	}
@@ -90,10 +101,10 @@ func (seg *Segment) Read(key string) ([]byte, bool, error) {
 	return bytesFromFile, true, nil
 }
 
-func encodeRow(row *SegmentRow) ([]byte, error) {
+func encode(segmentRow *segmentRow) ([]byte, error) {
 	bytesBuffer := bytes.Buffer{}
 	gobEncoder := gob.NewEncoder(&bytesBuffer)
-	err := gobEncoder.Encode(row)
+	err := gobEncoder.Encode(segmentRow)
 	if err != nil {
 		return nil, err
 	}
@@ -102,9 +113,9 @@ func encodeRow(row *SegmentRow) ([]byte, error) {
 	return encodedBytes, nil
 }
 
-func DecodeRow(bytesFromFile []byte) (*SegmentRow, error) {
+func decode(bytesFromFile []byte) (*segmentRow, error) {
 	var bytesBuffer bytes.Buffer
-	var row SegmentRow
+	var row segmentRow
 	stringBytes, err := base64.StdEncoding.DecodeString(string(bytesFromFile))
 	if err != nil {
 		return nil, err
