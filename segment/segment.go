@@ -6,8 +6,10 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/c3r/data-storage-engine/files"
+	"github.com/google/uuid"
 )
 
 const FilePathTemplate = "/tmp/tb_storage_%s"
@@ -18,10 +20,11 @@ type indexItem struct {
 }
 
 type segment struct {
-	Id       string
-	FilePath string
-	Offset   uint64
-	Index    map[string]*indexItem
+	id       string
+	filePath string
+	offset   uint64
+	syncMap  sync.Map //map[string]*indexItem
+	mutex    sync.Mutex
 }
 
 type segmentRow struct {
@@ -33,47 +36,56 @@ type SegmentTable struct {
 	segments []*segment
 }
 
-func (st *SegmentTable) Create(id string, order []string, table map[string]string) error {
-	s := &segment{
-		Id:       id,
-		FilePath: fmt.Sprintf(FilePathTemplate, id),
-		Index:    make(map[string]*indexItem),
+func (table *SegmentTable) Create(order []string, rows *sync.Map) error {
+	id := uuid.New().String()
+	segment := &segment{
+		id:       id,
+		filePath: fmt.Sprintf(FilePathTemplate, id),
+		syncMap:  sync.Map{},
+		mutex:    sync.Mutex{},
 	}
-	st.segments = append(st.segments, s)
 	for _, key := range order {
+		value, _ := rows.Load(key)
 		row := &segmentRow{
 			Key:   key,
-			Value: table[key],
+			Value: value.(string),
+		}
+		file, err := files.OpenFileWrite(segment.filePath)
+		if err != nil {
+			return err
 		}
 		bytes, err := encode(row)
 		if err != nil {
 			return err
 		}
-		file, err := files.OpenFileWrite(s.FilePath)
-		if err != nil {
-			return err
-		}
-		bytesWritten, err := files.Write(file, bytes, s.Offset)
+		bytesWritten, err := files.Write(file, bytes, segment.offset)
 		if err != nil {
 			return err
 		}
 		// After saving to file, update segment in memory
-		var item indexItem
-		item.Offset = s.Offset
-		item.Size = bytesWritten
-		s.Index[key] = &item
-		s.Offset += bytesWritten
+		segment.syncMap.Store(key, &indexItem{
+			Offset: segment.offset,
+			Size:   bytesWritten,
+		})
+		segment.offset += bytesWritten // atomic?
 	}
+	table.segments = append(table.segments, segment)
 	return nil
 }
 
-func (st *SegmentTable) Load(key string) (string, error) {
-	for _, s := range st.segments {
-		bytes, valueExists, err := s.read(key)
-		if err != nil {
-			return "", err
-		}
-		if valueExists {
+func (segmentTable *SegmentTable) Load(key string) (string, error) {
+	// This should be from the newest to oldest -> the newest value is saved later
+	for _, segment := range segmentTable.segments {
+		if item, valueExists := segment.syncMap.Load(key); valueExists {
+
+			file, err := files.OpenFileRead(segment.filePath)
+			if err != nil {
+				return "", err
+			}
+			bytes, err := files.Read(file, item.(*indexItem).Size, item.(*indexItem).Offset)
+			if err != nil {
+				return "", err
+			}
 			row, err := decode(bytes)
 			if err != nil {
 				return "", err
@@ -83,22 +95,6 @@ func (st *SegmentTable) Load(key string) (string, error) {
 	}
 	e := fmt.Errorf("key %s not found", key)
 	return "", errors.New(e.Error())
-}
-
-func (s *segment) read(key string) ([]byte, bool, error) {
-	item, valueExists := s.Index[key]
-	if !valueExists {
-		return nil, false, nil
-	}
-	file, err := files.OpenFileRead(s.FilePath)
-	if err != nil {
-		return nil, false, err
-	}
-	bytesFromFile, err := files.Read(file, item.Size, item.Offset)
-	if err != nil {
-		return nil, false, err
-	}
-	return bytesFromFile, true, nil
 }
 
 func encode(segmentRow *segmentRow) ([]byte, error) {

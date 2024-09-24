@@ -1,87 +1,89 @@
 package memtable
 
 import (
-	"slices"
-	"strconv"
+	"log"
 	"sync"
 	"sync/atomic"
 )
 
-type synchronizedKeyValueMap struct {
-	keyMap map[string]string
-	order  []string
-	mutex  sync.Mutex
+var logger = log.Default()
+
+type queue []int64
+
+func (queue *queue) Push(element int64) {
+	*queue = append(*queue, element)
 }
 
-type Memtable struct {
-	memtables map[string]*synchronizedKeyValueMap
-	Used      string
-	mutex     sync.Mutex
-	maxSize   int
-	Count     atomic.Uint64
-}
-
-func New(maxSize int) *Memtable {
-	tm := &Memtable{
-		memtables: make(map[string]*synchronizedKeyValueMap),
-		maxSize:   maxSize,
-		Count:     atomic.Uint64{},
-		Used:      "0",
+func (queue *queue) Pop() (int64, bool) {
+	head := *queue
+	length := len(head)
+	if length == 0 {
+		return 0, false
 	}
-	tm.initNext()
-	return tm
+	var element int64
+	element, *queue = head[0], head[1:length]
+	return element, true
 }
 
-func (tm *Memtable) Put(key string, value string) (string, bool) {
-	m := tm.memtables[tm.Used]
-	m.mutex.Lock()
-	m.keyMap[key] = value
-	m.order = append(m.order, key)
-	slices.Sort(m.order)
-	tm.mutex.Lock()
-	if len(m.keyMap) == tm.maxSize {
-		prev := tm.initNext()
-		tm.mutex.Unlock()
-		m.mutex.Unlock()
-		return prev, true
+type mtable struct {
+	syncMap *sync.Map
+	length  atomic.Int64
+}
+
+type MemtableManager struct {
+	memtables       *sync.Map
+	currentId       atomic.Int64
+	currentMemtable *mtable
+	maxSize         int64
+	removals        *queue
+	mutex           sync.Mutex
+}
+
+func New(maxSize int64) *MemtableManager {
+	manager := &MemtableManager{&sync.Map{}, atomic.Int64{}, nil, maxSize, &queue{}, sync.Mutex{}}
+	memtable := &mtable{&sync.Map{}, atomic.Int64{}}
+	manager.memtables.Store(0, memtable)
+	manager.currentMemtable = memtable
+	return manager
+}
+
+func (manager *MemtableManager) Store(key string, value string, dumpQueue chan int64) {
+	manager.mutex.Lock()
+	manager.currentMemtable.syncMap.Store(key, value)
+	id := manager.currentId.Load()
+	if manager.currentMemtable.length.Add(1) >= manager.maxSize {
+		memtable := &mtable{syncMap: &sync.Map{}}
+		manager.memtables.Store(manager.currentId.Add(1), memtable)
+		manager.currentMemtable = memtable
+		dumpQueue <- id
+		logger.Printf("Current dump queue length: %d", len(dumpQueue))
 	}
-	m.mutex.Unlock()
-	tm.mutex.Unlock()
-	return "", false
+	manager.mutex.Unlock()
 }
 
-func (tm *Memtable) Get(key string) (string, bool) {
-	tm.mutex.Lock()
-	for _, memtable := range tm.memtables {
-		value, valueExists := memtable.keyMap[key]
-		if valueExists {
-			tm.mutex.Unlock()
-			return value, true
+func (manager *MemtableManager) Load(key string) (string, bool) {
+	var value any
+	var valueExists bool
+	if value, valueExists = manager.currentMemtable.syncMap.Load(key); !valueExists {
+		manager.memtables.Range(func(_, memtable any) bool {
+			value, valueExists = memtable.(*mtable).syncMap.Load(key)
+			return !valueExists
+		})
+		if value == nil {
+			value = ""
 		}
 	}
-	tm.mutex.Unlock()
-	return "", false
+	return value.(string), valueExists
 }
 
-func (tm *Memtable) Clear(memtableKey string) {
-	tm.mutex.Lock()
-	delete(tm.memtables, memtableKey)
-	tm.mutex.Unlock()
+func (manager *MemtableManager) Clear(id int64) {
+	manager.memtables.Delete(id)
 }
 
-func (tm *Memtable) Dump(id string) ([]string, map[string]string) {
-	order := tm.memtables[id].order
-	table := tm.memtables[id].keyMap
-	return order, table
-}
-
-func (tm *Memtable) initNext() string {
-	tm.Count.Add(1)
-	prev := tm.Used
-	tm.Used = strconv.Itoa(int(tm.Count.Load()))
-	tm.memtables[tm.Used] = &synchronizedKeyValueMap{
-		keyMap: make(map[string]string),
-		order:  []string{},
+func (manager *MemtableManager) Dump(id int64) (*sync.Map, bool) {
+	if value, valueExists := manager.memtables.Load(id); valueExists {
+		mtable := value.(*mtable)
+		return mtable.syncMap, valueExists
 	}
-	return prev
+	return nil, false
 }
