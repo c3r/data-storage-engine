@@ -8,64 +8,53 @@ import (
 
 var logger = log.Default()
 
-type queue []int64
-
-func (queue *queue) Push(element int64) {
-	*queue = append(*queue, element)
-}
-
-func (queue *queue) Pop() (int64, bool) {
-	head := *queue
-	length := len(head)
-	if length == 0 {
-		return 0, false
-	}
-	var element int64
-	element, *queue = head[0], head[1:length]
-	return element, true
-}
-
 type mtable struct {
 	syncMap *sync.Map
 	length  atomic.Int64
 }
 
 type MemtableManager struct {
-	memtables       *sync.Map
-	currentId       atomic.Int64
-	currentMemtable *mtable
-	maxSize         int64
-	removals        *queue
-	mutex           sync.Mutex
+	mtables       *sync.Map
+	currId        atomic.Int64
+	currMtable    *mtable
+	maxMtableSize int64
+	mutex         sync.Mutex
+	dumpQueue     chan int64
 }
 
-func New(maxSize int64) *MemtableManager {
-	manager := &MemtableManager{&sync.Map{}, atomic.Int64{}, nil, maxSize, &queue{}, sync.Mutex{}}
-	memtable := &mtable{&sync.Map{}, atomic.Int64{}}
-	manager.memtables.Store(0, memtable)
-	manager.currentMemtable = memtable
-	return manager
-}
-
-func (manager *MemtableManager) Store(key string, value string, dumpQueue chan int64) {
-	manager.mutex.Lock()
-	manager.currentMemtable.syncMap.Store(key, value)
-	id := manager.currentId.Load()
-	if manager.currentMemtable.length.Add(1) >= manager.maxSize {
-		memtable := &mtable{syncMap: &sync.Map{}}
-		manager.memtables.Store(manager.currentId.Add(1), memtable)
-		manager.currentMemtable = memtable
-		dumpQueue <- id
-		logger.Printf("Current dump queue length: %d", len(dumpQueue))
+func New(maxSize int64, maxMtables int64) *MemtableManager {
+	mgr := &MemtableManager{
+		&sync.Map{},
+		atomic.Int64{},
+		nil,
+		maxSize,
+		sync.Mutex{},
+		make(chan int64, maxMtables),
 	}
-	manager.mutex.Unlock()
+	mtable := &mtable{&sync.Map{}, atomic.Int64{}}
+	mgr.mtables.Store(int64(0), mtable)
+	mgr.currMtable = mtable
+	return mgr
 }
 
-func (manager *MemtableManager) Load(key string) (string, bool) {
+func (mgr *MemtableManager) Store(key string, value string) {
+	mgr.mutex.Lock()
+	mgr.currMtable.syncMap.Store(key, value)
+	if mgr.currMtable.length.Add(1) >= mgr.maxMtableSize {
+		id := mgr.currId.Load()
+		memtable := &mtable{syncMap: &sync.Map{}}
+		mgr.mtables.Store(mgr.currId.Add(1), memtable)
+		mgr.currMtable = memtable
+		mgr.dumpQueue <- id
+	}
+	mgr.mutex.Unlock()
+}
+
+func (mgr *MemtableManager) Load(key string) (string, bool) {
 	var value any
 	var valueExists bool
-	if value, valueExists = manager.currentMemtable.syncMap.Load(key); !valueExists {
-		manager.memtables.Range(func(_, memtable any) bool {
+	if value, valueExists = mgr.currMtable.syncMap.Load(key); !valueExists {
+		mgr.mtables.Range(func(_, memtable any) bool {
 			value, valueExists = memtable.(*mtable).syncMap.Load(key)
 			return !valueExists
 		})
@@ -76,14 +65,14 @@ func (manager *MemtableManager) Load(key string) (string, bool) {
 	return value.(string), valueExists
 }
 
-func (manager *MemtableManager) Clear(id int64) {
-	manager.memtables.Delete(id)
+func (mgr *MemtableManager) Clear(id int64) {
+	mgr.mtables.Delete(id)
 }
 
-func (manager *MemtableManager) Dump(id int64) (*sync.Map, bool) {
-	if value, valueExists := manager.memtables.Load(id); valueExists {
-		mtable := value.(*mtable)
-		return mtable.syncMap, valueExists
+func (mgr *MemtableManager) Dump() (int64, *sync.Map) {
+	id := <-mgr.dumpQueue
+	if memtable, valueExists := mgr.mtables.Load(id); valueExists {
+		return id, memtable.(*mtable).syncMap
 	}
-	return nil, false
+	return -1, nil
 }

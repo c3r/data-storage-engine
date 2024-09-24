@@ -11,47 +11,39 @@ import (
 var logger log.Logger = *log.Default()
 
 type Storage struct {
-	memory    *memtable.MemtableManager
-	segments  segment.SegmentTable
-	dumpQueue chan int64
+	memory   *memtable.MemtableManager
+	segments segment.SegmentTable
 }
 
-func New(maxSegmentSize int64, maxSegments int64) *Storage {
-	memory := memtable.New(maxSegmentSize)
+func New(maxSegmentSize int64, maxSegments int64, segmentThreads int) *Storage {
+	memory := memtable.New(maxSegmentSize, maxSegments)
 	logger.Printf("Creating storage of max segment size %d...", maxSegmentSize)
-	storage := &Storage{
-		memory:    memory,
-		segments:  segment.SegmentTable{},
-		dumpQueue: make(chan int64, maxSegments),
-	}
-
-	for i := 0; i < 5; i++ {
-		go func(memory *memtable.MemtableManager) {
-			logger.Println("Staring segment-creator thread...")
-			for {
-				id := <-storage.dumpQueue
-				if rows, valueExists := memory.Dump(id); valueExists {
-					order := []string{}
-					rows.Range(func(key, value any) bool {
-						order = append(order, key.(string))
-						return true
-					})
-					slices.Sort(order)
-					err := storage.segments.Create(order, rows)
-					if err != nil {
-						panic(err)
-					}
-					logger.Printf("Segment-creator clearing memory with id=%d...", id)
-					memory.Clear(id) // TODO: how not leak id?
-				}
-			}
-		}(memory)
+	storage := &Storage{memory, segment.SegmentTable{}}
+	for i := 0; i < segmentThreads; i++ {
+		go storage.segmentThread()
 	}
 	return storage
 }
 
+func (storage *Storage) segmentThread() {
+	for {
+		id, rows := storage.memory.Dump()
+		order := []string{}
+		rows.Range(func(key, value any) bool {
+			order = append(order, key.(string))
+			return true
+		})
+		slices.Sort(order)
+		err := storage.segments.Create(order, rows)
+		if err != nil {
+			panic(err)
+		}
+		storage.memory.Clear(id)
+	}
+}
+
 func (storage *Storage) Save(key string, value string) {
-	storage.memory.Store(key, value, storage.dumpQueue)
+	storage.memory.Store(key, value)
 }
 
 func (storage *Storage) Load(key string) (string, error, bool) {
@@ -64,7 +56,6 @@ func (storage *Storage) Load(key string) (string, error, bool) {
 		if err != nil {
 			return "", err, false
 		}
-		// logger.Printf("Found %s on disk", key)
 	}
 	return value, nil, fromMemory
 }

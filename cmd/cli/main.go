@@ -48,7 +48,7 @@ func client(id string, storage *storage.Storage, size int32, wg *sync.WaitGroup)
 	// logger.Printf("C%-4s (%1d)[%-8d]", id, size, length)
 	for {
 		// if len(toSave) == 0 && (len(loadedDsk)+len(loadedMem)) == length {
-		if time.Since(clientStart).Minutes() > 5 {
+		if time.Since(clientStart).Minutes() > 1 {
 			var meanSaved int64
 			var meanLoadedMem int64
 			var meanLoadedDsk int64
@@ -127,8 +127,12 @@ func client(id string, storage *storage.Storage, size int32, wg *sync.WaitGroup)
 
 func main() {
 	logger := log.Default()
-	storage := storage.New(1024, 1024)
+	maxSegmentsSize := 1024
+	maxSegments := 1024
+	segmentThreads := 5
 	clients := 1000
+
+	storage := storage.New(int64(maxSegmentsSize), int64(maxSegments), segmentThreads)
 	wg := &sync.WaitGroup{}
 	start := time.Now()
 	for i := 0; i < clients; i++ {
