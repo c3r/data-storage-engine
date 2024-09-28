@@ -2,6 +2,7 @@ package files
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 )
 
@@ -23,19 +24,19 @@ func OpenFileWrite(filePath string) (*os.File, error) {
 	return file, nil
 }
 
-func OpenFileRead(filePath string) (*os.File, error) {
+func OpenFileRead(filePath string) (*os.File, fs.FileInfo, error) {
 	var file *os.File
-	if _, err := os.Stat(filePath); err == nil {
+	if info, err := os.Stat(filePath); err == nil {
 		file, err = os.Open(filePath)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		return file, info, nil
 	} else if errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return nil, nil, err
 	} else {
-		return nil, err
+		return nil, nil, err
 	}
-	return file, nil
 }
 
 func Read(file *os.File, size uint64, offset uint64) ([]byte, error) {

@@ -31,22 +31,28 @@ func New(maxSize int64, maxMtables int64) *MemtableManager {
 		sync.Mutex{},
 		make(chan int64, maxMtables),
 	}
-	mtable := &mtable{&sync.Map{}, atomic.Int64{}}
-	mgr.mtables.Store(int64(0), mtable)
-	mgr.currMtable = mtable
+	mtable1 := &mtable{&sync.Map{}, atomic.Int64{}}
+	mtable2 := &mtable{&sync.Map{}, atomic.Int64{}}
+	mgr.mtables.Store(int64(0), mtable1)
+	mgr.mtables.Store(int64(1), mtable2)
+	mgr.currMtable = mtable1
 	return mgr
 }
 
 func (mgr *MemtableManager) Store(key string, value string) {
+	// This lock is very bad for storing performance
+	// TODO: Try to figure out how to continue saving when maxMtableSize is reached
 	mgr.mutex.Lock()
-	mgr.currMtable.syncMap.Store(key, value)
 	if mgr.currMtable.length.Add(1) >= mgr.maxMtableSize {
-		id := mgr.currId.Load()
-		memtable := &mtable{syncMap: &sync.Map{}}
-		mgr.mtables.Store(mgr.currId.Add(1), memtable)
-		mgr.currMtable = memtable
-		mgr.dumpQueue <- id
+		mgr.dumpQueue <- mgr.currId.Load()
+		if currMemtable, ok := mgr.mtables.Load(mgr.currId.Load() + 1); ok {
+			mgr.currMtable = currMemtable.(*mtable)
+			mgr.currId.Add(1)
+			memtable := &mtable{syncMap: &sync.Map{}}
+			mgr.mtables.Store(mgr.currId.Load()+1, memtable)
+		}
 	}
+	mgr.currMtable.syncMap.Store(key, value)
 	mgr.mutex.Unlock()
 }
 
