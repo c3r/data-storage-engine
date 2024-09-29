@@ -99,7 +99,7 @@ func (table *SegmentTable) Create(order []string, rows *sync.Map) error {
 func (table *SegmentTable) Load(key string) (string, error) {
 	// This should be from the newest to oldest -> the newest value is saved later
 	for _, segment := range table.segments {
-		if value, valueExists, err := segment.search(key); err == nil {
+		if value, valueExists, err := segment.load(key); err == nil {
 			if valueExists {
 				return value, nil
 			}
@@ -111,69 +111,25 @@ func (table *SegmentTable) Load(key string) (string, error) {
 	return "", errors.New(e.Error())
 }
 
-func (segment *segment) search(key string) (string, bool, error) {
+func (segment *segment) load(key string) (string, bool, error) {
 	// Just open the file, we will be reading from it for sure
 	file, fileInfo, err := files.OpenFileRead(segment.filePath)
 	if err != nil {
 		return "", false, err
 	}
-	if offset, valueExists := segment.syncMap.Load(key); valueExists {
-		row, _, err := read(file, uint64(offset.(int64)))
-		if err != nil {
-			return "", false, err
+	offset, valueExists := segment.loadFromMap(key)
+	stop := offset
+	if !valueExists {
+		var startExists, stopExists bool
+		offset, stop, startExists, stopExists = segment.search(key)
+		if !startExists {
+			offset = int64(0)
 		}
-		return row.Value, true, nil
-	} else {
-		firstKey := segment.index[0]
-		lastKey := segment.index[len(segment.index)-1]
-
-		if key < firstKey {
-			if stop, valueExists := segment.syncMap.Load(firstKey); valueExists {
-				return search(key, file, 0, stop.(int64))
-			} else {
-				e := fmt.Errorf("firstKey %s not found", firstKey)
-				return "", false, errors.New(e.Error())
-			}
-		}
-
-		if key > lastKey {
-			if start, valueExists := segment.syncMap.Load(lastKey); valueExists {
-				return search(key, file, start.(int64), fileInfo.Size())
-			} else {
-				e := fmt.Errorf("lastKey %s not found", firstKey)
-				return "", false, errors.New(e.Error())
-			}
-		}
-
-		var startKey, stopKey string
-		for _, otherKey := range segment.index {
-			if key > otherKey {
-				startKey = otherKey
-				continue
-			}
-			if key < otherKey {
-				stopKey = otherKey
-				break
-			}
-		}
-
-		if start, valueExists := segment.syncMap.Load(startKey); valueExists {
-			if stop, valueExists := segment.syncMap.Load(stopKey); valueExists {
-				return search(key, file, start.(int64), stop.(int64))
-			} else {
-				e := fmt.Errorf("stopKey %s not found", firstKey)
-				return "", false, errors.New(e.Error())
-			}
-		} else {
-			e := fmt.Errorf("startKey %s not found", firstKey)
-			return "", false, errors.New(e.Error())
+		if !stopExists {
+			stop = fileInfo.Size()
 		}
 	}
-}
-
-func search(key string, file *os.File, start int64, stop int64) (string, bool, error) {
-	offset := start
-	for offset < stop {
+	for offset < fileInfo.Size() && offset <= stop {
 		row, bytesRead, err := read(file, uint64(offset))
 		if err != nil {
 			return "", false, err
@@ -184,6 +140,30 @@ func search(key string, file *os.File, start int64, stop int64) (string, bool, e
 		offset += int64(bytesRead)
 	}
 	return "", false, nil
+}
+
+func (segment *segment) search(key string) (int64, int64, bool, bool) {
+	var keyStart, keyStop string
+	for _, other := range segment.index {
+		if key > other {
+			keyStart = other
+			continue
+		}
+		if key < other {
+			keyStop = other
+			break
+		}
+	}
+	start, startExists := segment.loadFromMap(keyStart)
+	stop, stopExists := segment.loadFromMap(keyStop)
+	return start, stop, startExists, stopExists
+}
+
+func (segment *segment) loadFromMap(key string) (int64, bool) {
+	if offset, valueExists := segment.syncMap.Load(key); valueExists {
+		return offset.(int64), true
+	}
+	return 0, false
 }
 
 func read(file *os.File, offset uint64) (*segmentRow, uint64, error) {
