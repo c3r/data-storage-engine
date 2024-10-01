@@ -5,12 +5,21 @@ import (
 )
 
 type SynchronizedMap[K any, V any] struct {
-	syncMap sync.Map
+	syncMap *sync.Map
+}
+
+func New[K any, V any]() *SynchronizedMap[K, V] {
+	return &SynchronizedMap[K, V]{&sync.Map{}}
 }
 
 func (syncmap *SynchronizedMap[K, V]) Load(key K) (V, bool) {
-	value, _ := syncmap.syncMap.Load(key)
-	return value.(V), true
+	var result V
+	value, valueExists := syncmap.syncMap.Load(key)
+	if !valueExists {
+		return result, false
+	}
+	result = value.(V)
+	return result, true
 }
 
 func (syncmap *SynchronizedMap[K, V]) Store(key K, value V) {

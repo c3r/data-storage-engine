@@ -19,12 +19,10 @@ const FILE_PATH_TEMPLATE = "/tmp/tb_storage_%s"
 const DATA_LENGHT_BYTES_SIZE = 8
 const SEGMENT_SPARSE_TABLE_LVL = 10
 
-type segment struct {
-	id       string
-	filePath string
-	offset   int64
-	syncMap  *syncmap.SynchronizedMap[string, int64]
-	index    []string
+type Segment struct {
+	FilePath string
+	SyncMap  *syncmap.SynchronizedMap[string, int64]
+	Index    []string
 }
 
 type segmentRow struct {
@@ -33,23 +31,23 @@ type segmentRow struct {
 }
 
 type SegmentTable struct {
-	segments []*segment
+	segments []*Segment
 }
 
 func (table *SegmentTable) Create(order []string, rows *syncmap.SynchronizedMap[string, string]) error {
 	id := uuid.New().String()
-	segment := &segment{
-		id:       id,
-		filePath: fmt.Sprintf(FILE_PATH_TEMPLATE, id),
-		syncMap:  &syncmap.SynchronizedMap[string, int64]{},
+	segment := &Segment{
+		FilePath: fmt.Sprintf(FILE_PATH_TEMPLATE, id),
+		SyncMap:  syncmap.New[string, int64](),
 	}
+	offset := int64(0)
 	for idx, key := range order {
 		value, _ := rows.Load(key)
 		row := &segmentRow{
 			Key:   key,
 			Value: value,
 		}
-		file, err := files.OpenFileWrite(segment.filePath)
+		file, err := files.OpenFileWrite(segment.FilePath)
 		if err != nil {
 			return err
 		}
@@ -60,11 +58,11 @@ func (table *SegmentTable) Create(order []string, rows *syncmap.SynchronizedMap[
 		// First save the length of the data
 		dataLenBytes := make([]byte, DATA_LENGHT_BYTES_SIZE)
 		binary.LittleEndian.PutUint64(dataLenBytes, uint64(len(dataRowBytes)))
-		bytesWritten, err := file.WriteAt(dataLenBytes, segment.offset)
+		bytesWritten, err := file.WriteAt(dataLenBytes, offset)
 		if err != nil {
 			return err
 		}
-		bytesWritten, err = file.WriteAt(dataRowBytes, segment.offset+int64(bytesWritten))
+		bytesWritten, err = file.WriteAt(dataRowBytes, offset+int64(bytesWritten))
 		if err != nil {
 			return err
 		}
@@ -79,14 +77,18 @@ func (table *SegmentTable) Create(order []string, rows *syncmap.SynchronizedMap[
 		// After saving to file, update segment in memory
 		// Save in sparse table
 		if idx%SEGMENT_SPARSE_TABLE_LVL == 0 {
-			segment.syncMap.Store(key, segment.offset)
-			segment.index = append(segment.index, key)
+			segment.SyncMap.Store(key, offset)
+			segment.Index = append(segment.Index, key)
 		}
-		segment.offset += int64(bytesWritten) + DATA_LENGHT_BYTES_SIZE
+		offset += int64(bytesWritten) + DATA_LENGHT_BYTES_SIZE
 	}
-	slices.Sort(segment.index)
-	table.segments = append(table.segments, segment)
+	slices.Sort(segment.Index)
+	table.Insert(segment)
 	return nil
+}
+
+func (table *SegmentTable) Insert(segment *Segment) {
+	table.segments = append(table.segments, segment)
 }
 
 func (table *SegmentTable) Load(key string) (string, error) {
@@ -104,26 +106,22 @@ func (table *SegmentTable) Load(key string) (string, error) {
 	return "", errors.New(e.Error())
 }
 
-func (segment *segment) load(key string) (string, bool, error) {
+func (segment *Segment) load(key string) (string, bool, error) {
 	// Just open the file, we will be reading from it for sure
-	file, fileInfo, err := files.OpenFileRead(segment.filePath)
+	file, fileInfo, err := files.OpenFileRead(segment.FilePath)
 	if err != nil {
 		return "", false, err
 	}
-	offset, valueExists := segment.syncMap.Load(key)
-	stop := offset
-	if !valueExists {
-		var startExists, stopExists bool
-		offset, stop, startExists, stopExists = segment.search(key)
-		if !startExists {
-			offset = int64(0)
-		}
-		if !stopExists {
-			stop = fileInfo.Size()
-		}
+	defer files.Close(file)
+	var stop, offset int64
+	var valueExists bool
+	if offset, valueExists = segment.SyncMap.Load(key); valueExists {
+		stop = offset
+	} else {
+		offset, stop = segment.search(key, fileInfo.Size())
 	}
 	for offset < fileInfo.Size() && offset <= stop {
-		row, bytesRead, err := read(file, uint64(offset))
+		row, bytesRead, err := ReadFromFile(file, uint64(offset))
 		if err != nil {
 			return "", false, err
 		}
@@ -135,9 +133,9 @@ func (segment *segment) load(key string) (string, bool, error) {
 	return "", false, nil
 }
 
-func (segment *segment) search(key string) (int64, int64, bool, bool) {
+func (segment *Segment) search(key string, fileSize int64) (int64, int64) {
 	var keyStart, keyStop string
-	for _, other := range segment.index {
+	for _, other := range segment.Index {
 		if key > other {
 			keyStart = other
 			continue
@@ -147,12 +145,18 @@ func (segment *segment) search(key string) (int64, int64, bool, bool) {
 			break
 		}
 	}
-	start, startExists := segment.syncMap.Load(keyStart)
-	stop, stopExists := segment.syncMap.Load(keyStop)
-	return start, stop, startExists, stopExists
+	start, startExists := segment.SyncMap.Load(keyStart)
+	if !startExists {
+		start = int64(0)
+	}
+	stop, stopExists := segment.SyncMap.Load(keyStop)
+	if !stopExists {
+		stop = fileSize
+	}
+	return start, stop
 }
 
-func read(file *os.File, offset uint64) (*segmentRow, uint64, error) {
+func ReadFromFile(file *os.File, offset uint64) (*segmentRow, uint64, error) {
 	dataLenBytes, err := files.Read(file, DATA_LENGHT_BYTES_SIZE, offset)
 	if err != nil {
 		return nil, 0, err

@@ -25,15 +25,15 @@ type MemtableManager struct {
 
 func New(maxSize int64, maxMtables int64) *MemtableManager {
 	mgr := &MemtableManager{
-		&syncmap.SynchronizedMap[int64, *mtable]{},
+		syncmap.New[int64, *mtable](),
 		atomic.Int64{},
 		nil,
 		maxSize,
 		sync.Mutex{},
 		make(chan int64, maxMtables),
 	}
-	mtable1 := &mtable{&syncmap.SynchronizedMap[string, string]{}, atomic.Int64{}}
-	mtable2 := &mtable{&syncmap.SynchronizedMap[string, string]{}, atomic.Int64{}}
+	mtable1 := &mtable{syncmap.New[string, string](), atomic.Int64{}}
+	mtable2 := &mtable{syncmap.New[string, string](), atomic.Int64{}}
 	mgr.mtables.Store(int64(0), mtable1)
 	mgr.mtables.Store(int64(1), mtable2)
 	mgr.currMtable = mtable1
@@ -49,7 +49,7 @@ func (mgr *MemtableManager) Store(key string, value string) {
 		if currMemtable, ok := mgr.mtables.Load(mgr.currId.Load() + 1); ok {
 			mgr.currMtable = currMemtable
 			mgr.currId.Add(1)
-			memtable := &mtable{syncMap: &syncmap.SynchronizedMap[string, string]{}}
+			memtable := &mtable{syncMap: syncmap.New[string, string]()}
 			mgr.mtables.Store(mgr.currId.Load()+1, memtable)
 		}
 	}

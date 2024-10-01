@@ -48,18 +48,30 @@ func Read(file *os.File, size uint64, offset uint64) ([]byte, error) {
 	return bytesBuffer, nil
 }
 
-func Write(file *os.File, bytes []byte, writeOffset uint64) (uint64, error) {
-	bytesWritten, err := file.WriteAt(bytes, int64(writeOffset))
+func Close(file *os.File) error {
+	err := file.Sync()
 	if err != nil {
-		return 0, err
-	}
-	err = file.Sync()
-	if err != nil {
-		return 0, err
+		return err
 	}
 	err = file.Close()
 	if err != nil {
-		return 0, err
+		return err
 	}
-	return uint64(bytesWritten), err
+	return nil
 }
+
+// func Write(file *os.File, bytes []byte, writeOffset uint64) (uint64, error) {
+// 	bytesWritten, err := file.WriteAt(bytes, int64(writeOffset))
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	err = file.Sync()
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	err = file.Close()
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	return uint64(bytesWritten), err
+// }
