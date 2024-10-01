@@ -1,20 +1,21 @@
 package memtable
 
 import (
-	"log"
 	"sync"
 	"sync/atomic"
+
+	"github.com/c3r/data-storage-engine/syncmap"
 )
 
-var logger = log.Default()
+// var logger = log.Default()
 
 type mtable struct {
-	syncMap *sync.Map
+	syncMap *syncmap.SynchronizedMap[string, string]
 	length  atomic.Int64
 }
 
 type MemtableManager struct {
-	mtables       *sync.Map
+	mtables       *syncmap.SynchronizedMap[int64, *mtable]
 	currId        atomic.Int64
 	currMtable    *mtable
 	maxMtableSize int64
@@ -24,15 +25,15 @@ type MemtableManager struct {
 
 func New(maxSize int64, maxMtables int64) *MemtableManager {
 	mgr := &MemtableManager{
-		&sync.Map{},
+		&syncmap.SynchronizedMap[int64, *mtable]{},
 		atomic.Int64{},
 		nil,
 		maxSize,
 		sync.Mutex{},
 		make(chan int64, maxMtables),
 	}
-	mtable1 := &mtable{&sync.Map{}, atomic.Int64{}}
-	mtable2 := &mtable{&sync.Map{}, atomic.Int64{}}
+	mtable1 := &mtable{&syncmap.SynchronizedMap[string, string]{}, atomic.Int64{}}
+	mtable2 := &mtable{&syncmap.SynchronizedMap[string, string]{}, atomic.Int64{}}
 	mgr.mtables.Store(int64(0), mtable1)
 	mgr.mtables.Store(int64(1), mtable2)
 	mgr.currMtable = mtable1
@@ -46,9 +47,9 @@ func (mgr *MemtableManager) Store(key string, value string) {
 	if mgr.currMtable.length.Add(1) >= mgr.maxMtableSize {
 		mgr.dumpQueue <- mgr.currId.Load()
 		if currMemtable, ok := mgr.mtables.Load(mgr.currId.Load() + 1); ok {
-			mgr.currMtable = currMemtable.(*mtable)
+			mgr.currMtable = currMemtable
 			mgr.currId.Add(1)
-			memtable := &mtable{syncMap: &sync.Map{}}
+			memtable := &mtable{syncMap: &syncmap.SynchronizedMap[string, string]{}}
 			mgr.mtables.Store(mgr.currId.Load()+1, memtable)
 		}
 	}
@@ -57,28 +58,25 @@ func (mgr *MemtableManager) Store(key string, value string) {
 }
 
 func (mgr *MemtableManager) Load(key string) (string, bool) {
-	var value any
-	var valueExists bool
-	if value, valueExists = mgr.currMtable.syncMap.Load(key); !valueExists {
-		mgr.mtables.Range(func(_, memtable any) bool {
-			value, valueExists = memtable.(*mtable).syncMap.Load(key)
+	if value, valueExists := mgr.currMtable.syncMap.Load(key); valueExists {
+		return value, valueExists
+	} else {
+		mgr.mtables.Range(func(_ int64, memtable *mtable) bool {
+			value, valueExists = memtable.syncMap.Load(key)
 			return !valueExists
 		})
-		if value == nil {
-			value = ""
-		}
+		return value, valueExists
 	}
-	return value.(string), valueExists
 }
 
 func (mgr *MemtableManager) Clear(id int64) {
 	mgr.mtables.Delete(id)
 }
 
-func (mgr *MemtableManager) Dump() (int64, *sync.Map) {
+func (mgr *MemtableManager) Dump() (int64, *syncmap.SynchronizedMap[string, string]) {
 	id := <-mgr.dumpQueue
 	if memtable, valueExists := mgr.mtables.Load(id); valueExists {
-		return id, memtable.(*mtable).syncMap
+		return id, memtable.syncMap
 	}
 	return -1, nil
 }

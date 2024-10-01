@@ -7,12 +7,11 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"slices"
-	"sync"
 
 	"github.com/c3r/data-storage-engine/files"
+	"github.com/c3r/data-storage-engine/syncmap"
 	"github.com/google/uuid"
 )
 
@@ -20,17 +19,11 @@ const FILE_PATH_TEMPLATE = "/tmp/tb_storage_%s"
 const DATA_LENGHT_BYTES_SIZE = 8
 const SEGMENT_SPARSE_TABLE_LVL = 10
 
-var logger log.Logger = *log.Default()
-
-type indexItem struct {
-	Offset int64
-}
-
 type segment struct {
 	id       string
 	filePath string
 	offset   int64
-	syncMap  sync.Map
+	syncMap  *syncmap.SynchronizedMap[string, int64]
 	index    []string
 }
 
@@ -43,18 +36,18 @@ type SegmentTable struct {
 	segments []*segment
 }
 
-func (table *SegmentTable) Create(order []string, rows *sync.Map) error {
+func (table *SegmentTable) Create(order []string, rows *syncmap.SynchronizedMap[string, string]) error {
 	id := uuid.New().String()
 	segment := &segment{
 		id:       id,
 		filePath: fmt.Sprintf(FILE_PATH_TEMPLATE, id),
-		syncMap:  sync.Map{},
+		syncMap:  &syncmap.SynchronizedMap[string, int64]{},
 	}
 	for idx, key := range order {
 		value, _ := rows.Load(key)
 		row := &segmentRow{
 			Key:   key,
-			Value: value.(string),
+			Value: value,
 		}
 		file, err := files.OpenFileWrite(segment.filePath)
 		if err != nil {
@@ -117,7 +110,7 @@ func (segment *segment) load(key string) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	offset, valueExists := segment.loadFromMap(key)
+	offset, valueExists := segment.syncMap.Load(key)
 	stop := offset
 	if !valueExists {
 		var startExists, stopExists bool
@@ -154,16 +147,9 @@ func (segment *segment) search(key string) (int64, int64, bool, bool) {
 			break
 		}
 	}
-	start, startExists := segment.loadFromMap(keyStart)
-	stop, stopExists := segment.loadFromMap(keyStop)
+	start, startExists := segment.syncMap.Load(keyStart)
+	stop, stopExists := segment.syncMap.Load(keyStop)
 	return start, stop, startExists, stopExists
-}
-
-func (segment *segment) loadFromMap(key string) (int64, bool) {
-	if offset, valueExists := segment.syncMap.Load(key); valueExists {
-		return offset.(int64), true
-	}
-	return 0, false
 }
 
 func read(file *os.File, offset uint64) (*segmentRow, uint64, error) {

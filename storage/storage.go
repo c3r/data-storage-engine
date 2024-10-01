@@ -29,8 +29,8 @@ func (storage *Storage) segmentThread() {
 	for {
 		id, rows := storage.memory.Dump()
 		order := []string{}
-		rows.Range(func(key, value any) bool {
-			order = append(order, key.(string))
+		rows.Range(func(key, value string) bool {
+			order = append(order, key)
 			return true
 		})
 		slices.Sort(order)
