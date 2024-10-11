@@ -24,6 +24,13 @@ func OpenFileWrite(filePath string) (*os.File, error) {
 	return file, nil
 }
 
+func Delete(filePath string) error {
+	if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func OpenFileRead(filePath string) (*os.File, fs.FileInfo, error) {
 	var file *os.File
 	if info, err := os.Stat(filePath); err == nil {
