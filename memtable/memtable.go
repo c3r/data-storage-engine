@@ -15,7 +15,7 @@ type mtable struct {
 }
 
 type MemtableManager struct {
-	memtables         *syncmap.SynchronizedMap[int64, *mtable]
+	memtables         *syncmap.SynchronizedMap[int64, *mtable] // TODO: order matters
 	currentMemtableId atomic.Int64
 	currentMemtable   *mtable
 	maxMemtableSize   int64
@@ -61,6 +61,7 @@ func (mgr *MemtableManager) Load(key string) (string, bool) {
 	if value, valueExists := mgr.currentMemtable.syncMap.Load(key); valueExists {
 		return value, valueExists
 	} else {
+		// TODO: order matters!
 		mgr.memtables.Range(func(_ int64, memtable *mtable) bool {
 			value, valueExists = memtable.syncMap.Load(key)
 			return !valueExists

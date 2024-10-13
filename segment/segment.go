@@ -7,9 +7,9 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"slices"
+	"sync"
 
 	"github.com/c3r/data-storage-engine/files"
 	"github.com/c3r/data-storage-engine/syncmap"
@@ -17,13 +17,17 @@ import (
 )
 
 const FILE_PATH_TEMPLATE = "/tmp/tb_storage_%s"
-const DATA_LENGHT_BYTES_SIZE = 8
+const METADATA_FIELD_SIZE = 8
 const SEGMENT_SPARSE_TABLE_LVL = 5
 
 type Segment struct {
-	FilePath string
-	SyncMap  *syncmap.SynchronizedMap[string, int64]
-	Index    []string
+	Id         int64
+	RowsNumber int64
+	FilePath   string
+	DataOffset int64
+	FileSize   int64
+	SyncMap    *syncmap.SynchronizedMap[string, int64]
+	Index      []string
 }
 
 type segmentRow struct {
@@ -32,69 +36,29 @@ type segmentRow struct {
 }
 
 type SegmentTable struct {
-	segments []*Segment
+	segmentsMap   *syncmap.SynchronizedMap[int64, *Segment]
+	segmentsIndex []int64
+	lock          sync.Mutex
 }
 
-func (table *SegmentTable) CreatePersistentSegment(order []string, rows *syncmap.SynchronizedMap[string, string], segmentsFilePath string) (string, error) {
-	filePath := fmt.Sprintf(segmentsFilePath + "/" + uuid.New().String())
-	segment := &Segment{
-		FilePath: filePath,
-		SyncMap:  syncmap.New[string, int64](),
-	}
-	fileWriteOffset := int64(0)
-	// Open file for writing segment
-	file, err := files.OpenFileWrite(segment.FilePath)
-	if err != nil {
-		return filePath, err
-	}
-	for idx, key := range order {
-		value, _ := rows.Load(key)
-		// Encode data
-		encodedSegment, err := encodeSegment(&segmentRow{key, value})
-		if err != nil {
-			return filePath, err
-		}
-		// First encode and save the length of the data
-		encodedDataLength := make([]byte, DATA_LENGHT_BYTES_SIZE)
-		binary.LittleEndian.PutUint64(encodedDataLength, uint64(len(encodedSegment)))
-		bytesWritten, err := file.WriteAt(encodedDataLength, fileWriteOffset)
-		if err != nil {
-			return filePath, err
-		}
-		// Save the encoded data
-		bytesWritten, err = file.WriteAt(encodedSegment, fileWriteOffset+int64(bytesWritten))
-		if err != nil {
-			return filePath, err
-		}
-		// After saving to file, update segment in memory (save in sparse table)
-		if idx%SEGMENT_SPARSE_TABLE_LVL == 0 {
-			segment.SyncMap.Store(key, fileWriteOffset)
-			segment.Index = append(segment.Index, key)
-		}
-		fileWriteOffset += int64(bytesWritten) + DATA_LENGHT_BYTES_SIZE
-	}
-	// Sync and close file
-	err = file.Sync()
-	if err != nil {
-		return filePath, err
-	}
-	err = file.Close()
-	if err != nil {
-		return filePath, err
-	}
-	slices.Sort(segment.Index)
-	table.Insert(segment)
-	return filePath, nil
+func New() *SegmentTable {
+	return &SegmentTable{syncmap.New[int64, *Segment](), []int64{}, sync.Mutex{}}
 }
 
-func (table *SegmentTable) Insert(segment *Segment) {
-	// TODO: need to number segments - race condition when threads are persisting segments
-	table.segments = append(table.segments, segment)
+func (table *SegmentTable) PersistToFile(threadId int, id int64, order []string, rows *syncmap.SynchronizedMap[string, string], dirPath string) (string, error) {
+	segment, err := table.writeSegment(id, order, rows, dirPath)
+	if err != nil {
+		return "", err
+	}
+	table.insert(segment, threadId)
+	return segment.FilePath, nil
 }
 
 func (table *SegmentTable) Load(key string) (string, error) {
-	// TODO: Iterating from the newest to oldest: the newest value is saved later
-	for _, segment := range table.segments {
+	// Iterating from the newest to oldest: the newest value is saved later
+	for segmentKey := len(table.segmentsIndex) - 1; segmentKey >= 0; segmentKey-- {
+		idx := table.segmentsIndex[segmentKey]
+		segment, _ := table.segmentsMap.Load(idx)
 		value, valueExists, err := segment.search(key)
 		if err != nil {
 			return "", err
@@ -103,11 +67,11 @@ func (table *SegmentTable) Load(key string) (string, error) {
 			return value, nil
 		}
 	}
-	e := fmt.Errorf("key %s not found", key)
-	return "", errors.New(e.Error())
+	err := fmt.Errorf("key %s not found", key)
+	return "", errors.New(err.Error())
 }
 
-func (table *SegmentTable) LoadSegmentsFromDisk(segmentFilesDirectory string) error {
+func (table *SegmentTable) LoadSegmentsFromDisk(threadId int, segmentFilesDirectory string) error {
 	directoryEntries, err := os.ReadDir(segmentFilesDirectory)
 	if err != nil {
 		return err
@@ -117,130 +81,243 @@ func (table *SegmentTable) LoadSegmentsFromDisk(segmentFilesDirectory string) er
 			continue
 		}
 		filePath := fmt.Sprintf("%s/%s", segmentFilesDirectory, directoryEntry.Name())
-		seg := loadSegmentFromFile(filePath)
-		table.Insert(seg)
+		fmt.Printf("Loading segment from file %s...", filePath)
+		segment, err := loadSegmentFromFile(filePath)
+		if err != nil {
+			return err
+		}
+		// Lock
+		table.insert(segment, threadId)
+		// Unlock
 	}
 	return nil
 }
 
-func (table *SegmentTable) Compact(segmentsDirPath string) {
-	logger := log.Default()
-	segmentsNum := len(table.segments)
-	if segmentsNum < 2 {
-		return
+func (table *SegmentTable) Compact(threadId int, segmentsDirPath string) error {
+	if len(table.segmentsIndex) < 2 {
+		// Nothing to compact
+		return nil
 	}
-
-	olderFilePath := table.segments[segmentsNum-2].FilePath
-	newerFilePath := table.segments[segmentsNum-1].FilePath
-
-	older := loadRowsFromFile(olderFilePath)
-	newer := loadRowsFromFile(newerFilePath)
-	result, order := mergeSortRows(older, newer)
-	if filePath, err := table.CreatePersistentSegment(order, result, segmentsDirPath); err == nil {
-		table.segments = remove(table.segments, segmentsNum-1)
-		table.segments = remove(table.segments, segmentsNum-1)
-		logger.Printf("File %s saved.", filePath)
-		if err := files.Delete(olderFilePath); err != nil {
-			panic(err)
-		}
-		logger.Printf("File %s deleted.", olderFilePath)
-		if err := files.Delete(newerFilePath); err != nil {
-			panic(err)
-		}
-		logger.Printf("File %s deleted.", newerFilePath)
-	} else {
-		panic(err)
+	// LOCK
+	older, _ := table.segmentsMap.Load(table.segmentsIndex[len(table.segmentsIndex)-2])
+	newer, _ := table.segmentsMap.Load(table.segmentsIndex[len(table.segmentsIndex)-1])
+	// fmt.Printf("newer: %d, older: %d\n", newer.Id, older.Id)
+	if newer.RowsNumber != older.RowsNumber {
+		// Nothing to compact
+		return nil
 	}
-}
-
-func remove(slice []*Segment, s int) []*Segment {
-	return append(slice[:s], slice[s+1:]...)
-}
-
-func mergeSortRows(older []*segmentRow, newer []*segmentRow) (*syncmap.SynchronizedMap[string, string], []string) {
-	result := syncmap.New[string, string]()
-	var index []string
-	iOlder := 0
-	iNewer := 0
-	for iNewer <= len(older)-1 && iOlder <= len(newer)-1 {
-		if older[iOlder].Key == newer[iNewer].Key {
-			result.Store(newer[iNewer].Key, newer[iNewer].Value)
-			index = append(index, newer[iNewer].Key)
-			iNewer++
-			iOlder++
-		} else if older[iOlder].Key < newer[iNewer].Key {
-			result.Store(older[iOlder].Key, older[iOlder].Value)
-			index = append(index, older[iOlder].Key)
-			iOlder++
-		} else {
-			result.Store(newer[iNewer].Key, newer[iNewer].Value)
-			index = append(index, newer[iNewer].Key)
-			iNewer++
-		}
-		if iOlder == len(older) {
-			for _, row := range newer[iNewer:] {
-				result.Store(row.Key, row.Value)
-				index = append(index, row.Key)
-			}
-		} else if iNewer == len(newer) {
-			for _, row := range older[iOlder:] {
-				result.Store(row.Key, row.Value)
-				index = append(index, row.Key)
-			}
-		}
-	}
-
-	result.Range(func(key, value string) bool {
-		fmt.Printf("%s = %s\n", key, value)
-		return true
-	})
-
-	return result, index
-}
-
-func loadRowsFromFile(filePath string) []*segmentRow {
-	file, fileInfo, err := files.OpenFileRead(filePath)
+	// UNLOCK
+	rowsOlder, err := older.loadRowsFromFile()
 	if err != nil {
-		panic(err)
+		return err
 	}
-	offset := uint64(0)
-	var rows []*segmentRow
-	for offset < uint64(fileInfo.Size()) {
-		row, bytesRead, err := readRowFromFile(file, uint64(offset))
+	rowsNewer, err := newer.loadRowsFromFile()
+	if err != nil {
+		return err
+	}
+	rowMap, order := mergeSortRows(rowsOlder, rowsNewer)
+	merged, err := table.writeSegment(newer.Id, order, rowMap, segmentsDirPath)
+	if err != nil {
+		return err
+	}
+	// Lock
+	// Remove last two and insert the new segment:
+	// fmt.Printf("Removing segments %d and %d...", older.Id, newer.Id)
+	table.remove(older.Id)
+	table.remove(newer.Id)
+	// fmt.Printf("Inserting segment %d...", merged.Id)
+	table.insert(merged, threadId)
+	// Unlock
+	if err := files.Delete(older.FilePath); err != nil {
+		// TODO: add error and try later
+	}
+	if err := files.Delete(newer.FilePath); err != nil {
+		// TODO: add error and try later
+	}
+	return nil
+}
+
+// TODO: extract encode&save data to method
+// Private
+func (table *SegmentTable) writeSegment(id int64, order []string, rows *syncmap.SynchronizedMap[string, string], dirPath string) (*Segment, error) {
+	filePath := fmt.Sprintf(dirPath + "/" + uuid.New().String()) // TODO: handle slash ending
+	segment := &Segment{
+		Id:         id,
+		RowsNumber: int64(len(order)),
+		FilePath:   filePath,
+		FileSize:   int64(0),
+		DataOffset: METADATA_FIELD_SIZE * 2,
+		SyncMap:    syncmap.New[string, int64](),
+	}
+	// Open file for writing segment:
+	file, err := files.OpenFileWrite(segment.FilePath)
+	if err != nil {
+		return nil, err
+	}
+	// Encode and save the segment id:
+	encodedId := make([]byte, METADATA_FIELD_SIZE)
+	binary.LittleEndian.PutUint64(encodedId, uint64(segment.Id))
+	bytesWritten, err := file.WriteAt(encodedId, segment.FileSize)
+	if err != nil {
+		return nil, err
+	}
+	segment.FileSize += int64(bytesWritten)
+	// Encode and save the segment size:
+	encodedSize := make([]byte, METADATA_FIELD_SIZE)
+	binary.LittleEndian.PutUint64(encodedSize, uint64(segment.Id))
+	bytesWritten, err = file.WriteAt(encodedSize, segment.FileSize)
+	if err != nil {
+		return nil, err
+	}
+	segment.FileSize += int64(bytesWritten)
+	// For every row:
+	// encode and save the row with it's length:
+	for idx, key := range order {
+		value, _ := rows.Load(key) // TODO: error handling
+		// Encode data:
+		encodedRow, err := encodeRow(&segmentRow{key, value})
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		rows = append(rows, row)
-		offset += bytesRead
+		// Encode and save the length of the data:
+		encodedRowLength := make([]byte, METADATA_FIELD_SIZE)
+		binary.LittleEndian.PutUint64(encodedRowLength, uint64(len(encodedRow)))
+		encodedRowLengthWriteOffset := segment.FileSize //
+		bytesWritten, err = file.WriteAt(encodedRowLength, segment.FileSize)
+		if err != nil {
+			return nil, err
+		}
+		segment.FileSize += int64(bytesWritten)
+		// Save the encoded data:
+		bytesWritten, err = file.WriteAt(encodedRow, segment.FileSize)
+		if err != nil {
+			return nil, err
+		}
+		// After saving to file,
+		// 	FIRST update segment in memory (save in sparse table) and
+		//	SECOND increase the file size (write offset in this context):
+		if idx%SEGMENT_SPARSE_TABLE_LVL == 0 {
+			segment.SyncMap.Store(key, encodedRowLengthWriteOffset)
+			segment.Index = append(segment.Index, key)
+		}
+		segment.FileSize += int64(bytesWritten)
 	}
-	return rows
+	// Sync and close file
+	err = file.Sync()
+	if err != nil {
+		return nil, err
+	}
+	err = file.Close()
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(segment.Index)
+	return segment, nil
 }
 
 // Private
-func loadSegmentFromFile(filePath string) *Segment {
-	seg := &Segment{
+func (table *SegmentTable) insert(segment *Segment, threadId int) {
+	table.lock.Lock()
+	table.segmentsIndex = append(table.segmentsIndex, segment.Id)
+	slices.Sort(table.segmentsIndex)
+	table.segmentsMap.Store(segment.Id, segment)
+	table.lock.Unlock()
+}
+
+// Private
+func (table *SegmentTable) remove(segmentKeyToRemove int64) {
+	table.lock.Lock()
+	table.segmentsMap.Delete(segmentKeyToRemove)
+	for idx, segmentKey := range table.segmentsIndex {
+		if segmentKeyToRemove == int64(segmentKey) {
+			table.segmentsIndex = append(table.segmentsIndex[:idx], table.segmentsIndex[idx+1:]...)
+			break
+		}
+	}
+	table.lock.Unlock()
+}
+
+// Private
+func mergeSortRows(older []*segmentRow, newer []*segmentRow) (*syncmap.SynchronizedMap[string, string], []string) {
+	result := syncmap.New[string, string]()
+	var index []string
+	idxOlder := 0
+	idxNewer := 0
+	for idxNewer <= len(older)-1 && idxOlder <= len(newer)-1 {
+		if older[idxOlder].Key == newer[idxNewer].Key {
+			result.Store(newer[idxNewer].Key, newer[idxNewer].Value)
+			index = append(index, newer[idxNewer].Key)
+			idxNewer++
+			idxOlder++
+		} else if older[idxOlder].Key < newer[idxNewer].Key {
+			result.Store(older[idxOlder].Key, older[idxOlder].Value)
+			index = append(index, older[idxOlder].Key)
+			idxOlder++
+		} else {
+			result.Store(newer[idxNewer].Key, newer[idxNewer].Value)
+			index = append(index, newer[idxNewer].Key)
+			idxNewer++
+		}
+		if idxOlder == len(older) {
+			for _, row := range newer[idxNewer:] {
+				result.Store(row.Key, row.Value)
+				index = append(index, row.Key)
+			}
+		} else if idxNewer == len(newer) {
+			for _, row := range older[idxOlder:] {
+				result.Store(row.Key, row.Value)
+				index = append(index, row.Key)
+			}
+		}
+	}
+	return result, index
+}
+
+// Private
+// TODO: merge loadSegmentFromFile and loadRowsFromFile?
+func (segment *Segment) loadRowsFromFile() ([]*segmentRow, error) {
+	file, _, err := files.OpenFileRead(segment.FilePath)
+	if err != nil {
+		return nil, err
+	}
+	offset := segment.DataOffset
+	var rows []*segmentRow
+	for offset < segment.FileSize {
+		row, bytesRead, err := readRowFromFile(file, uint64(offset))
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+		offset += int64(bytesRead)
+	}
+	return rows, nil
+}
+
+// Private
+func loadSegmentFromFile(filePath string) (*Segment, error) {
+	segment := &Segment{
 		FilePath: filePath,
 		SyncMap:  syncmap.New[string, int64](),
 	}
 	file, fileInfo, err := files.OpenFileRead(filePath)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	offset := int64(0)
 	rowCount := 0
 	for offset < fileInfo.Size() {
 		row, bytesRead, err := readRowFromFile(file, uint64(offset))
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		seg.SyncMap.Store(row.Key, offset)
-		seg.Index = append(seg.Index, row.Key)
+		segment.SyncMap.Store(row.Key, offset) // TODO: sparse table - don't store everything in memory!
+		segment.Index = append(segment.Index, row.Key)
 		offset += int64(bytesRead)
 		rowCount++
 	}
-	slices.Sort(seg.Index)
+	slices.Sort(segment.Index)
 	files.Close(file)
-	return seg
+	return segment, nil
 }
 
 // Private
@@ -256,7 +333,7 @@ func (segment *Segment) search(key string) (string, bool, error) {
 	if offset, valueExists = segment.SyncMap.Load(key); valueExists {
 		stop = offset
 	} else {
-		offset, stop = segment.findNearestOffset(key, fileInfo.Size())
+		offset, stop = segment.findNearestOffset(key)
 	}
 	for offset < fileInfo.Size() && offset <= stop {
 		row, bytesRead, err := readRowFromFile(file, uint64(offset))
@@ -272,7 +349,7 @@ func (segment *Segment) search(key string) (string, bool, error) {
 }
 
 // Private
-func (segment *Segment) findNearestOffset(key string, offsetUpperBound int64) (int64, int64) {
+func (segment *Segment) findNearestOffset(key string) (int64, int64) {
 	var keyStart, keyStop string
 	for _, otherKey := range segment.Index {
 		if key > otherKey {
@@ -286,11 +363,11 @@ func (segment *Segment) findNearestOffset(key string, offsetUpperBound int64) (i
 	}
 	start, startExists := segment.SyncMap.Load(keyStart)
 	if !startExists {
-		start = int64(0)
+		start = segment.DataOffset
 	}
 	stop, stopExists := segment.SyncMap.Load(keyStop)
 	if !stopExists {
-		stop = offsetUpperBound
+		stop = segment.FileSize
 	}
 	return start, stop
 }
@@ -300,12 +377,12 @@ func (segment *Segment) findNearestOffset(key string, offsetUpperBound int64) (i
 //   - file is open and will be closed
 //   - offset < fileSize
 func readRowFromFile(file *os.File, offset uint64) (*segmentRow, uint64, error) {
-	dataLenBytes, err := files.Read(file, DATA_LENGHT_BYTES_SIZE, offset)
+	dataLenBytes, err := files.Read(file, METADATA_FIELD_SIZE, offset)
 	if err != nil {
 		return nil, 0, err
 	}
 	dataLen := binary.LittleEndian.Uint64(dataLenBytes)
-	bytes, err := files.Read(file, dataLen, offset+DATA_LENGHT_BYTES_SIZE)
+	bytes, err := files.Read(file, dataLen, offset+METADATA_FIELD_SIZE)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -313,11 +390,11 @@ func readRowFromFile(file *os.File, offset uint64) (*segmentRow, uint64, error) 
 	if err != nil {
 		return nil, 0, err
 	}
-	return row, dataLen + DATA_LENGHT_BYTES_SIZE, nil
+	return row, dataLen + METADATA_FIELD_SIZE, nil
 }
 
 // Private
-func encodeSegment(segmentRow *segmentRow) ([]byte, error) {
+func encodeRow(segmentRow *segmentRow) ([]byte, error) {
 	bytesBuffer := bytes.Buffer{}
 	gobEncoder := gob.NewEncoder(&bytesBuffer)
 	err := gobEncoder.Encode(segmentRow)

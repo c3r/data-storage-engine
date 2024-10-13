@@ -40,10 +40,24 @@ func main() {
 	stor.Save("ha", "drugi")
 	stor.Save("ix", "drugi")
 	stor.Save("jx", "drugi")
+	// Segment 3:
+	stor.Save("axx", "trzeci")
+	stor.Save("bxx", "trzeci")
+	stor.Save("cxx", "trzeci")
+	stor.Save("dxx", "trzeci")
+	stor.Save("exx", "trzeci")
+	stor.Save("fxx", "trzeci")
+	stor.Save("gxx", "trzeci")
+	stor.Save("h", "trzeci")
+	stor.Save("ixx", "trzeci")
+	stor.Save("jxx", "trzeci")
 	// Rest:
 	stor.Save("ZZZZ", "20")
+	stor.Save("ZZZZ", "21")
+	stor.Save("ZZZZ", "22")
+	stor.Save("ZZZZ", "23")
 
-	sleepFor := time.Duration(5) * time.Second
+	sleepFor := time.Duration(100) * time.Millisecond
 	time.Sleep(sleepFor)
 
 	stor.Compact(segmentsDir)
@@ -51,6 +65,12 @@ func main() {
 	assert("f", "drugi")
 	assert("ha", "drugi")
 	assert("d", "drugi")
+	assert("g", "pierwszy")
+	assert("k", "pierwszy")
+	assert("jx", "drugi")
+	assert("jxx", "trzeci")
+	assert("h", "trzeci")
+	assert("ZZZZ", "23")
 }
 
 func assert(key string, expectedValue string) {
@@ -58,7 +78,7 @@ func assert(key string, expectedValue string) {
 	if value == expectedValue {
 		logger.Println("OK!")
 	} else {
-		logger.Printf("expected: \"%s\", actual: \"%s\"", expectedValue, value)
+		logger.Printf("[%s]: expected: \"%s\", actual: \"%s\"", key, expectedValue, value)
 	}
 
 }

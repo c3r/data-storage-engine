@@ -1,18 +1,5 @@
 // package main
 
-// import (
-// 	"fmt"
-// 	"log"
-// 	"math"
-// 	"math/rand/v2"
-// 	"strconv"
-// 	"sync"
-// 	"sync/atomic"
-// 	"time"
-
-// 	"github.com/c3r/data-storage-engine/storage"
-// )
-
 // var saveRequestCount atomic.Uint64
 // var readMemRequestCount atomic.Uint64
 // var readDskRequestCount atomic.Uint64
@@ -120,4 +107,4 @@
 // 		logger.Printf("*** mean load dsk: %d us", readDskDuration.Load()/readDskRequestCount.Load())
 // 	}
 // 	logger.Printf("*** total: %d req/s", (readMemRequestCount.Load()+readDskRequestCount.Load()+saveRequestCount.Load())/uint64(elapsed.Seconds()))
-// }
+// };

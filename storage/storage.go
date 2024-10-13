@@ -12,43 +12,40 @@ var logger log.Logger = *log.Default()
 
 type Storage struct {
 	memory   *memtable.MemtableManager
-	segments segment.SegmentTable
+	segments *segment.SegmentTable
 }
 
 func New(maxSegmentSize int64, maxNumbersOfSegments int64, numberOfSegmentThreads int, segmentsDirPath string) *Storage {
 	memory := memtable.New(maxSegmentSize, maxNumbersOfSegments)
-	storage := &Storage{memory, segment.SegmentTable{}}
+	storage := &Storage{memory, segment.New()}
 	// Init segment threads
-	logger.Printf("Initializing %d segment threads...", numberOfSegmentThreads)
 	for threadIdx := 0; threadIdx < numberOfSegmentThreads; threadIdx++ {
-		go storage.segmentThread(segmentsDirPath)
+		go storage.segmentThread(segmentsDirPath, threadIdx)
 	}
 	// Load segments from disk
-	storage.segments.LoadSegmentsFromDisk(segmentsDirPath)
+	// storage.segments.LoadSegmentsFromDisk(segmentsDirPath)
 	return storage
 }
 
-func (storage *Storage) segmentThread(segmentsDirPath string) {
+func (storage *Storage) segmentThread(segmentsDirPath string, threadId int) {
 	for {
 		id, data := storage.memory.Dump()
-		logger.Printf("Creating file for id %d", id)
 		dataOrderIndex := []string{}
 		data.Range(func(key, value string) bool {
 			dataOrderIndex = append(dataOrderIndex, key)
 			return true
 		})
 		slices.Sort(dataOrderIndex)
-		filePath, err := storage.segments.CreatePersistentSegment(dataOrderIndex, data, segmentsDirPath)
+		_, err := storage.segments.PersistToFile(threadId, id, dataOrderIndex, data, segmentsDirPath)
 		if err != nil {
 			panic(err)
 		}
 		storage.memory.Clear(id)
-		logger.Printf("File %s saved.", filePath)
 	}
 }
 
 func (storage *Storage) Compact(segmentsDirPath string) {
-	storage.segments.Compact(segmentsDirPath)
+	storage.segments.Compact(999, segmentsDirPath)
 }
 
 func (storage *Storage) Save(key string, value string) {
