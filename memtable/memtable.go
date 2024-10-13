@@ -7,62 +7,67 @@ import (
 	"github.com/c3r/data-storage-engine/syncmap"
 )
 
-// var logger = log.Default()
-
-type mtable struct {
+type segment struct {
 	syncMap *syncmap.SynchronizedMap[string, string]
 	length  atomic.Int64
 }
 
-type MemtableManager struct {
-	memtables         *syncmap.SynchronizedMap[int64, *mtable] // TODO: order matters
-	currentMemtableId atomic.Int64
-	currentMemtable   *mtable
-	maxMemtableSize   int64
-	mutex             sync.Mutex
-	dumpQueue         chan int64
+func (segment *segment) store(key string, value string) int64 {
+	segment.syncMap.Store(key, value)
+	segment.length.Add(1)
+	return segment.length.Load()
 }
 
-func New(maxMtableSize int64, dumpQueueSize int64) *MemtableManager {
-	mgr := &MemtableManager{
-		syncmap.New[int64, *mtable](),
-		atomic.Int64{},
-		nil,
-		maxMtableSize,
-		sync.Mutex{},
-		make(chan int64, dumpQueueSize),
+func createSegment() *segment {
+	return &segment{syncMap: syncmap.New[string, string]()}
+}
+
+type Memtable struct {
+	segmentMap       *syncmap.SynchronizedMap[int64, *segment] // TODO: order matters
+	currentId        atomic.Int64
+	currentSegment   *segment
+	maxSegmentLength int64
+	mutex            sync.Mutex
+	dumpQueue        chan int64
+}
+
+func New(maxSegmentLength int64, dumpQueueSize int64) *Memtable {
+	table := &Memtable{
+		segmentMap:       syncmap.New[int64, *segment](),
+		currentId:        atomic.Int64{},
+		currentSegment:   nil,
+		maxSegmentLength: maxSegmentLength,
+		mutex:            sync.Mutex{},
+		dumpQueue:        make(chan int64, dumpQueueSize),
 	}
-	mtable1 := &mtable{syncmap.New[string, string](), atomic.Int64{}}
-	mtable2 := &mtable{syncmap.New[string, string](), atomic.Int64{}}
-	mgr.memtables.Store(int64(0), mtable1)
-	mgr.memtables.Store(int64(1), mtable2)
-	mgr.currentMemtable = mtable1
-	return mgr
+	table.currentSegment = createSegment()
+	table.segmentMap.Store(int64(0), table.currentSegment)
+	table.segmentMap.Store(int64(1), createSegment())
+	return table
 }
 
-func (mgr *MemtableManager) Store(key string, value string) {
+func (table *Memtable) Store(key string, value string) {
 	// This lock is very bad for storing performance
 	// TODO: Try to figure out how to continue saving when maxMtableSize is reached
-	mgr.mutex.Lock()
-	mgr.currentMemtable.syncMap.Store(key, value)
-	if mgr.currentMemtable.length.Add(1) == mgr.maxMemtableSize {
-		mgr.dumpQueue <- mgr.currentMemtableId.Load()
-		if currMemtable, ok := mgr.memtables.Load(mgr.currentMemtableId.Load() + 1); ok {
-			mgr.currentMemtable = currMemtable
-			mgr.currentMemtableId.Add(1)
-			memtable := &mtable{syncMap: syncmap.New[string, string]()}
-			mgr.memtables.Store(mgr.currentMemtableId.Load()+1, memtable)
-		}
+	var dumpId int64
+	table.mutex.Lock()
+	if table.currentSegment.store(key, value) == table.maxSegmentLength {
+		dumpId = table.currentId.Load()
+		table.currentSegment, _ = table.segmentMap.Load(table.currentId.Add(1))
+		table.mutex.Unlock()
+		table.dumpQueue <- dumpId
+		table.segmentMap.Store(table.currentId.Load()+1, createSegment())
+	} else {
+		table.mutex.Unlock()
 	}
-	mgr.mutex.Unlock()
 }
 
-func (mgr *MemtableManager) Load(key string) (string, bool) {
-	if value, valueExists := mgr.currentMemtable.syncMap.Load(key); valueExists {
+func (table *Memtable) Load(key string) (string, bool) {
+	if value, valueExists := table.currentSegment.syncMap.Load(key); valueExists {
 		return value, valueExists
 	} else {
 		// TODO: order matters!
-		mgr.memtables.Range(func(_ int64, memtable *mtable) bool {
+		table.segmentMap.Range(func(_ int64, memtable *segment) bool {
 			value, valueExists = memtable.syncMap.Load(key)
 			return !valueExists
 		})
@@ -70,13 +75,13 @@ func (mgr *MemtableManager) Load(key string) (string, bool) {
 	}
 }
 
-func (mgr *MemtableManager) Clear(id int64) {
-	mgr.memtables.Delete(id)
+func (table *Memtable) Clear(id int64) {
+	table.segmentMap.Delete(id)
 }
 
-func (mgr *MemtableManager) Dump() (int64, *syncmap.SynchronizedMap[string, string]) {
-	memtableId := <-mgr.dumpQueue
-	if memtable, valueExists := mgr.memtables.Load(memtableId); valueExists {
+func (table *Memtable) Dump() (int64, *syncmap.SynchronizedMap[string, string]) {
+	memtableId := <-table.dumpQueue
+	if memtable, valueExists := table.segmentMap.Load(memtableId); valueExists {
 		return memtableId, memtable.syncMap
 	}
 	return -1, nil
