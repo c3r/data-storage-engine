@@ -34,7 +34,7 @@ func remove(slice []string, s int) []string {
 	return append(slice[:s], slice[s+1:]...)
 }
 
-func client(id string, storage *storage.Storage, size int32, wg *sync.WaitGroup) {
+func client(clientId string, storage *storage.Storage, size int32, wg *sync.WaitGroup) {
 	defer wg.Done()
 	logger := log.Default()
 
@@ -52,7 +52,7 @@ func client(id string, storage *storage.Storage, size int32, wg *sync.WaitGroup)
 	}
 
 	for i := 0; i < length; i++ {
-		key := fmt.Sprintf("%s:%s", id, strconv.Itoa(i))
+		key := fmt.Sprintf("%s:%s", clientId, strconv.Itoa(i))
 		valuesToSave[key] = RandStringBytes(256)
 		keysToSave = append(keysToSave, key)
 	}
@@ -72,7 +72,7 @@ func client(id string, storage *storage.Storage, size int32, wg *sync.WaitGroup)
 			}
 			idx := rand.IntN(len(valuesToSave))
 			key := keysToSave[idx]
-			value := fmt.Sprintf("[%s]-%s:::%s", id, key, valuesToSave[key])
+			value := fmt.Sprintf("[%s]-%s:::%s", clientId, key, valuesToSave[key])
 			expectedValues[key] = valuesToSave[key]
 			delete(valuesToSave, key)
 			remove(keysToSave, idx)
@@ -101,7 +101,7 @@ func client(id string, storage *storage.Storage, size int32, wg *sync.WaitGroup)
 			if err != nil {
 				logger.Println(err)
 			}
-			expectedValue := fmt.Sprintf("[%s]-%s:::%s", id, key, expectedValues[key])
+			expectedValue := fmt.Sprintf("[%s]-%s:::%s", clientId, key, expectedValues[key])
 			if expectedValue != actualValue {
 				logger.Fatalf("ASSERTION ERROR:\nexpected value = %s\nactualvalue = %s\n\n", expectedValue, actualValue)
 			}
@@ -111,13 +111,13 @@ func client(id string, storage *storage.Storage, size int32, wg *sync.WaitGroup)
 
 func main() {
 	logger := log.Default()
-	maxSegmentsSize := 1024 * 10
+	maxSegmentsSize := 1024 * 2
 	maxSegments := 1024
 	segmentThreads := 3
-	clients := 200
+	clients := 100
 	segmentsDir := "/tmp/tb_storage"
 
-	storage := storage.New(int64(maxSegmentsSize), int64(maxSegments), segmentThreads, segmentsDir, 5)
+	storage := storage.NewStorage(int64(maxSegmentsSize), int64(maxSegments), segmentThreads, segmentsDir, 20)
 	wg := &sync.WaitGroup{}
 	start := time.Now()
 	for i := 0; i < clients; i++ {
