@@ -175,8 +175,8 @@ func (storage *Storage) segmentsSearch(key string) (string, bool) {
 	var val string
 	var valueExists bool
 	var err error
-	storage.segments.ValuesReverse(func(seg *seg.Segment) bool {
-		val, valueExists, err = seg.Load(key)
+	storage.segments.ValuesReverse(func(segment *seg.Segment) bool {
+		val, valueExists, err = segment.Load(key)
 		return err == nil && !valueExists
 	})
 	return val, valueExists

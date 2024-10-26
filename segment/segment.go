@@ -110,7 +110,6 @@ func (s *Segment) writeSegment(data Data) (*Segment, error) {
 		//	SECOND increase the file size (write offset in this context):
 		if idx%SEGMENT_SPARSE_TABLE_LVL == 0 {
 			s.offsetIndex.Store(key, encodedRowLengthWriteOffset)
-			// segment.index = append(segment.index, key)
 		}
 		s.fileSize += int64(bytesWritten)
 		idx++
@@ -241,7 +240,6 @@ func (segment *Segment) Merge(other *Segment, filePath string) (*Segment, error)
 		}
 	}
 	merged, err := CreateSegment(other.Id, result, filePath)
-
 	return merged, err
 }
 
@@ -253,12 +251,13 @@ func (s *Segment) findNearestOffset(dataKey string) (int64, int64) {
 	s.offsetIndex.Keys(func(key string) bool {
 		if dataKey > key {
 			startKey = key
-			return false
+			return true
 		}
 		if dataKey < key {
 			stopKey = key
+			return false
 		}
-		return false
+		return true
 	})
 	if start, valueExists = s.offsetIndex.Load(startKey); !valueExists {
 		start = s.offset
