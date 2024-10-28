@@ -2,8 +2,11 @@ package files
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+
+	"github.com/google/uuid"
 )
 
 func OpenFileWrite(filePath string) (*os.File, error) {
@@ -67,18 +70,15 @@ func Close(file *os.File) error {
 	return nil
 }
 
-// func Write(file *os.File, bytes []byte, writeOffset uint64) (uint64, error) {
-// 	bytesWritten, err := file.WriteAt(bytes, int64(writeOffset))
-// 	if err != nil {
-// 		return 0, err
-// 	}
-// 	err = file.Sync()
-// 	if err != nil {
-// 		return 0, err
-// 	}
-// 	err = file.Close()
-// 	if err != nil {
-// 		return 0, err
-// 	}
-// 	return uint64(bytesWritten), err
-// }
+func Create(dir string) (string, error) {
+	filePath := fmt.Sprintf(dir + "/" + uuid.New().String()) // TODO: handle slash ending
+	file, err := OpenFileWrite(filePath)
+	if err != nil {
+		return "", err
+	}
+	err = Close(file)
+	if err != nil {
+		return "", err
+	}
+	return filePath, nil
+}

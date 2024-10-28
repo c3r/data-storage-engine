@@ -111,10 +111,10 @@ func client(clientId string, storage *storage.Storage, size int32, wg *sync.Wait
 
 func main() {
 	logger := log.Default()
-	maxSegmentsSize := 1024 * 2
+	maxSegmentsSize := 1024 * 10
 	maxSegments := 1024
 	segmentThreads := 3
-	clients := 100
+	clients := 200
 	segmentsDir := "/tmp/tb_storage"
 
 	storage := storage.NewStorage(int64(maxSegmentsSize), int64(maxSegments), segmentThreads, segmentsDir, 20)

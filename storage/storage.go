@@ -7,10 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/c3r/data-storage-engine/files"
 	seg "github.com/c3r/data-storage-engine/segment"
 	sm "github.com/c3r/data-storage-engine/syncmap"
-	"github.com/google/uuid"
 )
 
 type (
@@ -58,6 +56,8 @@ func NewStorage(maxSegmentSize int64, maxSegments int64, segThreads int, dirPath
 		queue:     make(chan int64, maxSegments),
 	}
 	storage.memtables.Store(int64(0), _newDataTable())
+
+	// Start segmentation threads
 	for range segThreads {
 		go func() {
 			for {
@@ -67,8 +67,7 @@ func NewStorage(maxSegmentSize int64, maxSegments int64, segThreads int, dirPath
 					msg := fmt.Sprintf("memtable with id %d does not exist", id)
 					panic(msg)
 				}
-				filePath := fmt.Sprintf(storage.dir + "/" + uuid.New().String()) // TODO: handle slash ending
-				segment, err := seg.CreateSegment(id, table, filePath)
+				segment, err := seg.CreateSegment(id, table, storage.dir)
 				if err != nil {
 					panic(err)
 				}
@@ -78,66 +77,53 @@ func NewStorage(maxSegmentSize int64, maxSegments int64, segThreads int, dirPath
 			}
 		}()
 	}
+
+	// Start compaction thread
 	go func() {
 		for {
 			time.Sleep(time.Duration(compactPeriod) * time.Second)
 			size := storage.segments.Size()
-			if size >= 2 {
-				if older, valueExists := storage.segments.LoadOrdered(size - 2); valueExists {
-					if newer, valueExists := storage.segments.LoadOrdered(size - 1); valueExists {
-						if newer.Size() != older.Size() {
-							continue
-						}
-						filePath := fmt.Sprintf(storage.dir + "/" + uuid.New().String())
-						merged, err := older.Merge(newer, filePath)
-						if err != nil {
-							log.Println("Error while compacting")
-							continue
-						}
-						storage.segments.Delete(older.Id)
-						storage.segments.Swap(newer.Id, merged)
-						go func() {
-							older.Wait()
-							files.Delete(older.FilePath)
-						}()
-						go func() {
-							newer.Wait()
-							files.Delete(newer.FilePath)
-						}()
-					}
-				}
-			} else {
-				// log.Println("Not enough segments")
+			if size < 2 {
+				continue
+			}
+			olderSegmentId := size - 2
+			newerSegmentId := size - 1
+			olderSegment, valueExists := storage.segments.LoadOrdered(olderSegmentId)
+			if !valueExists {
+				log.Printf("Error while compacting: segment %d does not exist", olderSegmentId)
+				continue
+			}
+			newerSegment, valueExists := storage.segments.LoadOrdered(newerSegmentId)
+			if !valueExists {
+				log.Printf("Error while compacting: segment %d does not exist", newerSegmentId)
+				continue
+			}
+			if newerSegment.Size() != olderSegment.Size() {
+				continue
+			}
+			merged, err := olderSegment.Merge(newerSegment, storage.dir)
+			if err != nil {
+				log.Printf("Error while compacting: %s", err.Error())
+				continue
+			}
+			storage.segments.Delete(olderSegment.Id)
+			storage.segments.Swap(newerSegment.Id, merged)
+			if err = olderSegment.Delete(); err != nil {
+				log.Printf("Cannot delete segment %d: %s", olderSegment.Id, err.Error())
+			}
+			if err = newerSegment.Delete(); err != nil {
+				log.Printf("Cannot delete segment %d: %s", olderSegment.Id, err.Error())
 			}
 		}
 	}()
 
-	// Load segments from disk
-	// entries, err := os.ReadDir(segmentsDirPath)
-	// if err != nil {
-	// 	return err
-	// }
-	// for _, directoryEntry := range entries {
-	// 	if !directoryEntry.Type().IsRegular() {
-	// 		continue
+	// Load persisted segments into memory
+	// if segments, err := segment.LoadPersistedSegments(storage.dir); err == nil {
+	// 	for _, segment := range segments {
+	// 		storage.segments.Store(segment.Id, segment)
 	// 	}
-	// 	filePath := fmt.Sprintf("%s/%s", dirPath, directoryEntry.Name())
-	// 	segment, err := loadSegmentFromFile(filePath)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	storage.segments.Store(segment.id, segment)
 	// }
-	// End load segments from disk
 	return storage
-}
-
-func (storage *Storage) removeSegment(id int64) {
-	if segment, ok := storage.segments.Load(id); ok {
-		if err := files.Delete(segment.FilePath); err != nil {
-			storage.segments.Delete(id)
-		}
-	}
 }
 
 func (storage *Storage) Save(key string, value string) {
@@ -162,30 +148,34 @@ func (storage *Storage) Load(key string) (string, error, bool) {
 	var val string
 	var valueExists bool
 	var isMemory bool = true
+	var err error
 	if val, valueExists = storage.tablesSearch(key); !valueExists {
 		isMemory = false
-		if val, valueExists = storage.segmentsSearch(key); !valueExists {
+		if val, valueExists, err = storage.segmentsSearch(key); !valueExists {
+			if err != nil {
+				return val, err, isMemory
+			}
 			return val, fmt.Errorf("value not found for %s", key), isMemory
 		}
 	}
 	return val, nil, isMemory
 }
 
-func (storage *Storage) segmentsSearch(key string) (string, bool) {
+func (storage *Storage) segmentsSearch(key string) (string, bool, error) {
 	var val string
 	var valueExists bool
 	var err error
-	storage.segments.ValuesReverse(func(segment *seg.Segment) bool {
+	storage.segments.ForValuesReverse(func(segment *seg.Segment) bool {
 		val, valueExists, err = segment.Load(key)
 		return err == nil && !valueExists
 	})
-	return val, valueExists
+	return val, valueExists, err
 }
 
 func (storage *Storage) tablesSearch(key string) (string, bool) {
 	var val string
 	var valueExists bool
-	storage.memtables.Values(func(table Memtable) bool {
+	storage.memtables.ForValues(func(table Memtable) bool {
 		val, valueExists = table.Load(key)
 		return !valueExists
 	})

@@ -74,7 +74,7 @@ func (s *Ordered[K, V]) deleteOrder(k K) {
 	}
 }
 
-func (s *Ordered[K, V]) Entries(f func(k K, v V) bool) {
+func (s *Ordered[K, V]) ForRange(f func(k K, v V) bool) {
 	for _, k := range s.order {
 		v, valueExists := s.data.Load(k)
 		if !valueExists {
@@ -86,7 +86,7 @@ func (s *Ordered[K, V]) Entries(f func(k K, v V) bool) {
 	}
 }
 
-func (s *Ordered[K, V]) Keys(f func(k K) bool) {
+func (s *Ordered[K, V]) ForKeys(f func(k K) bool) {
 	for _, k := range s.order {
 		if !f(k) {
 			break
@@ -94,7 +94,7 @@ func (s *Ordered[K, V]) Keys(f func(k K) bool) {
 	}
 }
 
-func (s *Ordered[K, V]) Values(f func(v V) bool) {
+func (s *Ordered[K, V]) ForValues(f func(v V) bool) {
 	for _, k := range s.order {
 		v, valueExists := s.data.Load(k)
 		if !valueExists {
@@ -106,7 +106,7 @@ func (s *Ordered[K, V]) Values(f func(v V) bool) {
 	}
 }
 
-func (s *Ordered[K, V]) ValuesReverse(f func(value V) bool) {
+func (s *Ordered[K, V]) ForValuesReverse(f func(value V) bool) {
 	for i := len(s.order) - 1; i >= 0; i-- {
 		k := s.order[i]
 		v, valueExists := s.data.Load(k)

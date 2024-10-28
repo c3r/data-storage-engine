@@ -5,6 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/gob"
+	"fmt"
+	"io/fs"
+	"log"
 	"os"
 	"sync"
 
@@ -12,9 +15,8 @@ import (
 	"github.com/c3r/data-storage-engine/syncmap"
 )
 
-const FILE_PATH_TEMPLATE = "/tmp/tb_storage_%s"
-const METADATA_FIELD_SIZE = 8
-const SEGMENT_SPARSE_TABLE_LVL = 2
+const M_LEN = 8
+const S_LVL = 2
 
 type (
 	OffsetIndex = *syncmap.Ordered[string, int64]
@@ -22,201 +24,127 @@ type (
 )
 
 type Segment struct {
-	Id          int64
-	FilePath    string
-	offset      int64
-	fileSize    int64
-	offsetIndex OffsetIndex
-	Wg          sync.WaitGroup
+	Id           int64
+	filePath     string
+	headerLength int64
+	fileSize     int64
+	index        OffsetIndex
+	wg           sync.WaitGroup
 }
 
-type PersistentRow struct {
+type persistentRow struct {
 	Key   string
 	Value string
 }
 
-func CreateSegment(id int64, data Data, filePath string) (*Segment, error) {
-	s := &Segment{
-		Id:          id,
-		FilePath:    filePath,
-		fileSize:    int64(0),
-		offset:      METADATA_FIELD_SIZE * 2,
-		offsetIndex: syncmap.New[string, int64](),
-	}
-	s, err := s.writeSegment(data)
-	if err != nil {
+func CreateSegment(id int64, data Data, dir string) (*Segment, error) {
+	var bytesWritten, rowNum int
+	var err error
+	var row []byte
+	var file *os.File
+	var filePath string
+	if filePath, err = files.Create(dir); err != nil {
 		return nil, err
 	}
-	return s, nil
+	s := &Segment{
+		Id:           id,
+		filePath:     filePath,
+		fileSize:     int64(0),
+		headerLength: int64(0),
+		index:        syncmap.New[string, int64](),
+	}
+	encode := func(segmentRow *persistentRow) ([]byte, error) {
+		buf := bytes.Buffer{}
+		encoder := gob.NewEncoder(&buf)
+		err := encoder.Encode(segmentRow)
+		if err != nil {
+			return nil, err
+		}
+		er := base64.StdEncoding.EncodeToString(buf.Bytes())
+		encodedBytes := []byte(er)
+		return encodedBytes, nil
+	}
+	write_int := func(value int64) error {
+		buf := make([]byte, M_LEN)
+		binary.LittleEndian.PutUint64(buf, uint64(value))
+		bytesWritten, err = file.WriteAt(buf, s.fileSize)
+		s.fileSize += int64(bytesWritten)
+		return err
+	}
+	write_data := func(data []byte) error {
+		bytesWritten, err = file.WriteAt(data, s.fileSize)
+		s.fileSize += int64(bytesWritten)
+		return err
+	}
+	index_store := func(key string, value int64) {
+		if rowNum%S_LVL == 0 {
+			s.index.Store(key, value)
+		}
+		rowNum++
+	}
+	if file, err = files.OpenFileWrite(s.filePath); err != nil {
+		return nil, err
+	}
+	if err = write_int(s.Id); err != nil {
+		return nil, err
+	}
+	s.headerLength += M_LEN
+	data.ForRange(func(k, v string) bool {
+		if row, err = encode(&persistentRow{k, v}); err != nil {
+			return false
+		}
+		length := int64(len(row))
+		if err = write_int(length); err != nil {
+			return false
+		}
+		if err = write_data(row); err != nil {
+			return false
+		}
+		index_store(k, s.fileSize-length-M_LEN)
+		return true
+	})
+	if err == nil {
+		if err = files.Close(file); err == nil {
+			return s, nil
+		}
+	}
+	return nil, err
 }
 
 func (s *Segment) Size() int64 {
-	return s.offsetIndex.Size()
+	return s.index.Size()
 }
 
-// TODO: extract encode&save data to method
-// Private
-func (s *Segment) writeSegment(data Data) (*Segment, error) {
-	// Open file for writing segment:
-	file, err := files.OpenFileWrite(s.FilePath)
-	if err != nil {
-		return nil, err
-	}
-	// Encode and save the segment id:
-	encodedId := make([]byte, METADATA_FIELD_SIZE)
-	binary.LittleEndian.PutUint64(encodedId, uint64(s.Id))
-	bytesWritten, err := file.WriteAt(encodedId, s.fileSize)
-	if err != nil {
-		return nil, err
-	}
-	s.fileSize += int64(bytesWritten)
-	// Encode and save the segment size:
-	encodedSize := make([]byte, METADATA_FIELD_SIZE)
-	binary.LittleEndian.PutUint64(encodedSize, uint64(s.Id))
-	bytesWritten, err = file.WriteAt(encodedSize, s.fileSize)
-	if err != nil {
-		return nil, err
-	}
-	s.fileSize += int64(bytesWritten)
-	// For every row:
-	// encode and save the row with it's length:
-	var e error
-	var idx int
-	data.Entries(func(key, value string) bool {
-		// Encode data:
-		encodedRow, err := encode(&PersistentRow{key, value})
-		if err != nil {
-			e = err
-			return false
-		}
-		// Encode and save the length of the data:
-		encodedRowLength := make([]byte, METADATA_FIELD_SIZE)
-		binary.LittleEndian.PutUint64(encodedRowLength, uint64(len(encodedRow)))
-		encodedRowLengthWriteOffset := s.fileSize //
-		bytesWritten, err = file.WriteAt(encodedRowLength, s.fileSize)
-		if err != nil {
-			e = err
-			return false
-		}
-		s.fileSize += int64(bytesWritten)
-		// Save the encoded data:
-		bytesWritten, err = file.WriteAt(encodedRow, s.fileSize)
-		if err != nil {
-			e = err
-			return false
-		}
-		// After saving to file,
-		// 	FIRST update segment in memory (save in sparse table) and
-		//	SECOND increase the file size (write offset in this context):
-		if idx%SEGMENT_SPARSE_TABLE_LVL == 0 {
-			s.offsetIndex.Store(key, encodedRowLengthWriteOffset)
-		}
-		s.fileSize += int64(bytesWritten)
-		idx++
-		return true
-	})
-	if e != nil {
-		return nil, e
-	}
-	// Sync and close file
-	err = file.Sync()
-	if err != nil {
-		return nil, err
-	}
-	err = file.Close()
-	if err != nil {
-		return nil, err
-	}
-	return s, nil
-}
-
-// TODO: merge loadSegmentFromFile and loadRowsFromFile?
-func (s *Segment) LoadRowsFromFile() ([]*PersistentRow, error) {
-	file, _, err := files.OpenFileRead(s.FilePath)
-	if err != nil {
-		return nil, err
-	}
-	offset := s.offset
-	var rows []*PersistentRow
-	for offset < s.fileSize {
-		row, bytesRead, err := readRowFromFile(file, uint64(offset))
+// Compaction - start
+func (s *Segment) Merge(other *Segment, dir string) (*Segment, error) {
+	var rows, rowsOther []*persistentRow
+	var err error
+	var it1, it2 int
+	loadRowsFromFile := func(s *Segment) ([]*persistentRow, error) {
+		file, _, err := files.OpenFileRead(s.filePath)
 		if err != nil {
 			return nil, err
 		}
-		rows = append(rows, row)
-		offset += int64(bytesRead)
+		offset := s.headerLength
+		var rows []*persistentRow
+		for offset < s.fileSize {
+			row, bytesRead, err := readRowFromFile(file, uint64(offset))
+			if err != nil {
+				return nil, err
+			}
+			rows = append(rows, row)
+			offset += int64(bytesRead)
+		}
+		return rows, nil
 	}
-	return rows, nil
-}
 
-// Private
-func loadSegmentFromFile(filePath string) (*Segment, error) {
-	segment := &Segment{
-		FilePath:    filePath,
-		offsetIndex: syncmap.New[string, int64](),
-	}
-	file, fileInfo, err := files.OpenFileRead(filePath)
-	if err != nil {
+	if rows, err = loadRowsFromFile(s); err != nil {
 		return nil, err
 	}
-	offset := int64(0)
-	for offset < fileInfo.Size() {
-		row, bytesRead, err := readRowFromFile(file, uint64(offset))
-		if err != nil {
-			return nil, err
-		}
-		segment.offsetIndex.Store(row.Key, offset) // TODO: sparse table - don't store everything in memory!
-		offset += int64(bytesRead)
-	}
-	files.Close(file)
-	return segment, nil
-}
-
-func (s *Segment) Wait() {
-	s.Wg.Wait()
-}
-
-func (s *Segment) Load(key string) (string, bool, error) {
-	s.Wg.Add(1)
-	defer s.Wg.Done()
-	// Just open the file, we will be reading from it for sure
-	file, fileInfo, err := files.OpenFileRead(s.FilePath)
-	if err != nil {
-		return "", false, err
-	}
-	defer files.Close(file)
-	var stop, offset int64
-	var valueExists bool
-	if offset, valueExists = s.offsetIndex.Load(key); valueExists {
-		stop = offset
-	} else {
-		offset, stop = s.findNearestOffset(key)
-	}
-	for offset < fileInfo.Size() && offset <= stop {
-		row, bytesRead, err := readRowFromFile(file, uint64(offset))
-		if err != nil {
-			return "", false, err
-		}
-		if row.Key == key {
-			return row.Value, true, nil
-		}
-		offset += int64(bytesRead)
-	}
-	return "", false, nil
-}
-
-func (segment *Segment) Merge(other *Segment, filePath string) (*Segment, error) {
-	rows, err := segment.LoadRowsFromFile()
-	if err != nil {
-		return nil, err
-	}
-	rowsOther, err := other.LoadRowsFromFile()
-	if err != nil {
+	if rowsOther, err = loadRowsFromFile(other); err != nil {
 		return nil, err
 	}
 	result := syncmap.New[string, string]()
-	it1 := 0
-	it2 := 0
 	for it2 <= len(rows)-1 && it1 <= len(rowsOther)-1 {
 		if rows[it1].Key == rowsOther[it2].Key {
 			result.Store(rowsOther[it2].Key, rowsOther[it2].Value)
@@ -239,82 +167,154 @@ func (segment *Segment) Merge(other *Segment, filePath string) (*Segment, error)
 			}
 		}
 	}
-	merged, err := CreateSegment(other.Id, result, filePath)
-	return merged, err
+	return CreateSegment(other.Id, result, dir)
 }
 
-// Private
-func (s *Segment) findNearestOffset(dataKey string) (int64, int64) {
-	var startKey, stopKey string
-	var start, stop int64
-	var valueExists bool
-	s.offsetIndex.Keys(func(key string) bool {
-		if dataKey > key {
-			startKey = key
+// Compaction - stop
+
+func LoadPersistedSegments(dir string) ([]*Segment, error) {
+	var err error
+	loadSegmentFromFile := func(filePath string) (*Segment, error) {
+		var file *os.File
+		var fileInfo os.FileInfo
+		var offset int64
+		var bytesRead uint64
+		var row *persistentRow
+		s := &Segment{
+			filePath: filePath,
+			index:    syncmap.New[string, int64](),
+		}
+		if file, fileInfo, err = files.OpenFileRead(filePath); err != nil {
+			return nil, err
+		}
+		if s.Id, err = readField(file, uint64(offset)); err != nil {
+			return nil, err
+		}
+		offset += M_LEN
+		for offset < fileInfo.Size() {
+			if row, bytesRead, err = readRowFromFile(file, uint64(offset)); err != nil {
+				return nil, err
+			}
+			s.index.Store(row.Key, offset) // TODO: sparse table - don't store everything in memory!
+			offset += int64(bytesRead)
+		}
+		files.Close(file)
+		return s, nil
+	}
+	var segments []*Segment
+	var dirEntries []fs.DirEntry
+	if dirEntries, err = os.ReadDir(dir); err != nil {
+		return nil, err
+	}
+	for _, entry := range dirEntries {
+		var s *Segment
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		filePath := fmt.Sprintf("%s/%s", dir, entry.Name())
+		if s, err = loadSegmentFromFile(filePath); err != nil {
+			log.Printf("Cannot load from file %s: %s", filePath, err.Error())
+		}
+		segments = append(segments, s)
+	}
+	return segments, nil
+}
+
+func (s *Segment) Delete() error {
+	s.wg.Wait()
+	return files.Delete(s.filePath)
+}
+
+func (s *Segment) Load(key string) (string, bool, error) {
+	find := func(dataKey string) (int64, int64) {
+		var startKey, stopKey string
+		var start, stop int64
+		var valueExists bool
+		s.index.ForKeys(func(_key string) bool {
+			if dataKey > _key {
+				startKey = _key
+				return true
+			}
+			if dataKey < _key {
+				stopKey = _key
+				return false
+			}
 			return true
+		})
+		if start, valueExists = s.index.Load(startKey); !valueExists {
+			start = s.headerLength
 		}
-		if dataKey < key {
-			stopKey = key
-			return false
+		if stop, valueExists = s.index.Load(stopKey); !valueExists {
+			stop = s.fileSize
 		}
-		return true
-	})
-	if start, valueExists = s.offsetIndex.Load(startKey); !valueExists {
-		start = s.offset
+		return start, stop
 	}
-	if stop, valueExists = s.offsetIndex.Load(stopKey); !valueExists {
-		stop = s.fileSize
-	}
-	return start, stop
-}
-
-// Private1
-// Assumptions:
-//   - file is open and will be closed
-//   - offset < fileSize
-func readRowFromFile(file *os.File, offset uint64) (*PersistentRow, uint64, error) {
-	dataLenBytes, err := files.Read(file, METADATA_FIELD_SIZE, offset)
+	s.wg.Add(1)
+	defer s.wg.Done()
+	// Just open the file, we will be reading from it for sure
+	file, fileInfo, err := files.OpenFileRead(s.filePath)
 	if err != nil {
-		return nil, 0, err
+		return "", false, err
 	}
-	dataLen := binary.LittleEndian.Uint64(dataLenBytes)
-	bytes, err := files.Read(file, dataLen, offset+METADATA_FIELD_SIZE)
-	if err != nil {
-		return nil, 0, err
+	defer files.Close(file)
+	var stop, offset int64
+	var valueExists bool
+	if offset, valueExists = s.index.Load(key); valueExists {
+		stop = offset
+	} else {
+		offset, stop = find(key)
 	}
-	row, err := decode(bytes)
-	if err != nil {
-		return nil, 0, err
+	for offset < fileInfo.Size() && offset <= stop {
+		row, bytesRead, err := readRowFromFile(file, uint64(offset))
+		if err != nil {
+			return "", false, err
+		}
+		if row.Key == key {
+			return row.Value, true, nil
+		}
+		offset += int64(bytesRead)
 	}
-	return row, dataLen + METADATA_FIELD_SIZE, nil
+	return "", false, nil
 }
 
 // Private
-func encode(segmentRow *PersistentRow) ([]byte, error) {
-	bytesBuffer := bytes.Buffer{}
-	gobEncoder := gob.NewEncoder(&bytesBuffer)
-	err := gobEncoder.Encode(segmentRow)
-	if err != nil {
-		return nil, err
+func readRowFromFile(file *os.File, offset uint64) (*persistentRow, uint64, error) {
+	decode := func(bytesFromFile []byte) (*persistentRow, error) {
+		var buf bytes.Buffer
+		var row persistentRow
+		bytes, err := base64.StdEncoding.DecodeString(string(bytesFromFile))
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(bytes)
+		decoder := gob.NewDecoder(&buf)
+		err = decoder.Decode(&row)
+		if err != nil {
+			return nil, err
+		}
+		return &row, nil
 	}
-	encodedRow := base64.StdEncoding.EncodeToString(bytesBuffer.Bytes())
-	encodedBytes := []byte(encodedRow)
-	return encodedBytes, nil
+	var row *persistentRow
+	var err error
+	var dataLen int64
+	var dataBytes []byte
+	if dataLen, err = readField(file, offset); err != nil {
+		return nil, 0, err
+	}
+	if dataBytes, err = files.Read(file, uint64(dataLen), offset+M_LEN); err != nil {
+		return nil, 0, err
+	}
+	if row, err = decode(dataBytes); err != nil {
+		return nil, 0, err
+	}
+	return row, uint64(dataLen) + M_LEN, nil
 }
 
-// Private
-func decode(bytesFromFile []byte) (*PersistentRow, error) {
-	var bytesBuffer bytes.Buffer
-	var row PersistentRow
-	stringBytes, err := base64.StdEncoding.DecodeString(string(bytesFromFile))
-	if err != nil {
-		return nil, err
+func readField(file *os.File, offset uint64) (int64, error) {
+	var buf []byte
+	var err error
+	if buf, err = files.Read(file, M_LEN, offset); err == nil {
+		return int64(binary.LittleEndian.Uint64(buf)), nil
 	}
-	bytesBuffer.Write(stringBytes)
-	decoder := gob.NewDecoder(&bytesBuffer)
-	err = decoder.Decode(&row)
-	if err != nil {
-		return nil, err
-	}
-	return &row, nil
+	return 0, err
 }
