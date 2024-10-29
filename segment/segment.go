@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"slices"
 	"sync"
 
 	"github.com/c3r/data-storage-engine/files"
@@ -20,7 +21,7 @@ const S_LVL = 2
 
 type (
 	OffsetIndex = *syncmap.Ordered[string, int64]
-	Data        = *syncmap.Ordered[string, string]
+	Data        = *sync.Map
 )
 
 type Segment struct {
@@ -56,12 +57,11 @@ func CreateSegment(id int64, data Data, dir string) (*Segment, error) {
 	encode := func(segmentRow *persistentRow) ([]byte, error) {
 		buf := bytes.Buffer{}
 		encoder := gob.NewEncoder(&buf)
-		err := encoder.Encode(segmentRow)
-		if err != nil {
+		if err := encoder.Encode(segmentRow); err != nil {
 			return nil, err
 		}
-		er := base64.StdEncoding.EncodeToString(buf.Bytes())
-		encodedBytes := []byte(er)
+		encr := base64.StdEncoding.EncodeToString(buf.Bytes())
+		encodedBytes := []byte(encr)
 		return encodedBytes, nil
 	}
 	write_int := func(value int64) error {
@@ -89,20 +89,26 @@ func CreateSegment(id int64, data Data, dir string) (*Segment, error) {
 		return nil, err
 	}
 	s.headerLength += M_LEN
-	data.ForRange(func(k, v string) bool {
-		if row, err = encode(&persistentRow{k, v}); err != nil {
-			return false
+	var order []string
+	data.Range(func(key, value any) bool {
+		order = append(order, key.(string))
+		return true
+	})
+	slices.Sort(order)
+	for _, k := range order {
+		v, _ := data.Load(k)
+		if row, err = encode(&persistentRow{k, v.(string)}); err != nil {
+			break
 		}
 		length := int64(len(row))
 		if err = write_int(length); err != nil {
-			return false
+			break
 		}
 		if err = write_data(row); err != nil {
-			return false
+			break
 		}
 		index_store(k, s.fileSize-length-M_LEN)
-		return true
-	})
+	}
 	if err == nil {
 		if err = files.Close(file); err == nil {
 			return s, nil
@@ -137,14 +143,13 @@ func (s *Segment) Merge(other *Segment, dir string) (*Segment, error) {
 		}
 		return rows, nil
 	}
-
 	if rows, err = loadRowsFromFile(s); err != nil {
 		return nil, err
 	}
 	if rowsOther, err = loadRowsFromFile(other); err != nil {
 		return nil, err
 	}
-	result := syncmap.New[string, string]()
+	result := &sync.Map{}
 	for it2 <= len(rows)-1 && it1 <= len(rowsOther)-1 {
 		if rows[it1].Key == rowsOther[it2].Key {
 			result.Store(rowsOther[it2].Key, rowsOther[it2].Value)
@@ -174,6 +179,8 @@ func (s *Segment) Merge(other *Segment, dir string) (*Segment, error) {
 
 func LoadPersistedSegments(dir string) ([]*Segment, error) {
 	var err error
+	var segments []*Segment
+	var dirEntries []fs.DirEntry
 	loadSegmentFromFile := func(filePath string) (*Segment, error) {
 		var file *os.File
 		var fileInfo os.FileInfo
@@ -201,8 +208,6 @@ func LoadPersistedSegments(dir string) ([]*Segment, error) {
 		files.Close(file)
 		return s, nil
 	}
-	var segments []*Segment
-	var dirEntries []fs.DirEntry
 	if dirEntries, err = os.ReadDir(dir); err != nil {
 		return nil, err
 	}

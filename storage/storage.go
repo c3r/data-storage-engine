@@ -12,11 +12,11 @@ import (
 )
 
 type (
-	Memtable = *sm.Ordered[string, string]
+	Memtable = *sync.Map
 )
 
 func _newDataTable() Memtable {
-	return sm.New[string, string]()
+	return &sync.Map{}
 }
 
 type Segments struct {
@@ -41,6 +41,7 @@ type Storage struct {
 	segments  Segments
 	dir       string
 	maxLen    int64
+	currLen   atomic.Int64
 	mutex     sync.Mutex
 	queue     chan int64
 }
@@ -80,40 +81,58 @@ func NewStorage(maxSegmentSize int64, maxSegments int64, segThreads int, dirPath
 
 	// Start compaction thread
 	go func() {
+		var err error
+		var merged *seg.Segment
+		compact_segments := func(segment1 *seg.Segment, segment2 *seg.Segment) {
+			defer func() {
+				if err = segment1.Delete(); err != nil {
+					log.Printf("Cannot delete segment %d: %s", segment1.Id, err.Error())
+				}
+				if err = segment2.Delete(); err != nil {
+					log.Printf("Cannot delete segment %d: %s", segment1.Id, err.Error())
+				}
+			}()
+			log.Printf("Compacting segments %d and %d...", segment1.Id, segment2.Id)
+			merged, err = segment1.Merge(segment2, storage.dir)
+			if err != nil {
+				log.Printf("Error while compacting: %s", err.Error())
+				return
+			}
+			storage.segments.Delete(segment1.Id)
+			storage.segments.Swap(segment2.Id, merged)
+			log.Printf("Segments %d and %d compacted. Segments: %d", segment1.Id, segment2.Id, storage.segments.Size())
+		}
+		var firstId int64
+		var otherSegment *seg.Segment
+		var valueExists bool
 		for {
 			time.Sleep(time.Duration(compactPeriod) * time.Second)
 			size := storage.segments.Size()
 			if size < 2 {
 				continue
 			}
-			olderSegmentId := size - 2
-			newerSegmentId := size - 1
-			olderSegment, valueExists := storage.segments.LoadOrdered(olderSegmentId)
-			if !valueExists {
-				log.Printf("Error while compacting: segment %d does not exist", olderSegmentId)
-				continue
-			}
-			newerSegment, valueExists := storage.segments.LoadOrdered(newerSegmentId)
-			if !valueExists {
-				log.Printf("Error while compacting: segment %d does not exist", newerSegmentId)
-				continue
-			}
-			if newerSegment.Size() != olderSegment.Size() {
-				continue
-			}
-			merged, err := olderSegment.Merge(newerSegment, storage.dir)
-			if err != nil {
-				log.Printf("Error while compacting: %s", err.Error())
-				continue
-			}
-			storage.segments.Delete(olderSegment.Id)
-			storage.segments.Swap(newerSegment.Id, merged)
-			if err = olderSegment.Delete(); err != nil {
-				log.Printf("Cannot delete segment %d: %s", olderSegment.Id, err.Error())
-			}
-			if err = newerSegment.Delete(); err != nil {
-				log.Printf("Cannot delete segment %d: %s", olderSegment.Id, err.Error())
-			}
+			firstId = -1
+			storage.segments.ForValues(func(segment *seg.Segment) bool {
+				if segment.Id == firstId {
+					return true
+				}
+				if firstId == -1 {
+					firstId = segment.Id
+					return true
+				}
+				if otherSegment, valueExists = storage.segments.Load(firstId); !valueExists {
+					log.Printf("Error while compacting: segment %d does not exist", firstId)
+					return true
+				}
+				if segment.Size() != otherSegment.Size() {
+					log.Printf("%d and %d are different sizes (%d != %d)", segment.Id, otherSegment.Id, segment.Size(), otherSegment.Size())
+					firstId = segment.Id
+					return true
+				}
+				compact_segments(otherSegment, segment)
+				firstId = -1
+				return true
+			})
 		}
 	}()
 
@@ -126,58 +145,45 @@ func NewStorage(maxSegmentSize int64, maxSegments int64, segThreads int, dirPath
 	return storage
 }
 
-func (storage *Storage) Save(key string, value string) {
-	// This lock is very bad for storing performance
-	// TODO: Try to figure out how to continue saving when maxLen is reached
+func (storage *Storage) Save(key string, value string) error {
+	var table *sync.Map
+	var valueExists bool
 	storage.mutex.Lock()
-	defer storage.mutex.Unlock()
 	id := storage.currId.Load()
-	if table, valueExists := storage.memtables.Load(id); valueExists {
-		table.Store(key, value)
-		if table.Size() == storage.maxLen {
-			storage.queue <- id
-			storage.memtables.Store(storage.currId.Load()+1, _newDataTable())
-			storage.currId.Add(1)
-		}
-	} else {
-		panic("no current memtable")
+	if table, valueExists = storage.memtables.Load(id); !valueExists {
+		return fmt.Errorf("no current memtable")
 	}
+	defer storage.mutex.Unlock()
+	table.Store(key, value)
+	storage.currLen.Add(1)
+	if storage.currLen.Load() == storage.maxLen {
+		storage.queue <- id
+		storage.memtables.Store(storage.currId.Load()+1, _newDataTable())
+		storage.currId.Add(1)
+		storage.currLen.Swap(0)
+	}
+	return nil
 }
 
 func (storage *Storage) Load(key string) (string, error, bool) {
-	var val string
-	var valueExists bool
-	var isMemory bool = true
-	var err error
-	if val, valueExists = storage.tablesSearch(key); !valueExists {
-		isMemory = false
-		if val, valueExists, err = storage.segmentsSearch(key); !valueExists {
-			if err != nil {
-				return val, err, isMemory
-			}
-			return val, fmt.Errorf("value not found for %s", key), isMemory
-		}
-	}
-	return val, nil, isMemory
-}
-
-func (storage *Storage) segmentsSearch(key string) (string, bool, error) {
-	var val string
+	var value any
 	var valueExists bool
 	var err error
-	storage.segments.ForValuesReverse(func(segment *seg.Segment) bool {
-		val, valueExists, err = segment.Load(key)
-		return err == nil && !valueExists
-	})
-	return val, valueExists, err
-}
-
-func (storage *Storage) tablesSearch(key string) (string, bool) {
-	var val string
-	var valueExists bool
 	storage.memtables.ForValues(func(table Memtable) bool {
-		val, valueExists = table.Load(key)
+		value, valueExists = table.Load(key)
 		return !valueExists
 	})
-	return val, valueExists
+	if valueExists {
+		return value.(string), nil, true
+	}
+	storage.segments.ForValuesReverse(func(segment *seg.Segment) bool {
+		value, valueExists, err = segment.Load(key)
+		return err == nil && !valueExists
+	})
+	if err != nil {
+		return "", err, false
+	} else if !valueExists {
+		return value.(string), fmt.Errorf("value not found for %s", key), false
+	}
+	return value.(string), nil, false
 }
