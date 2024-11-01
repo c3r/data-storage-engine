@@ -68,7 +68,7 @@ func NewStorage(maxSegmentSize int64, maxSegments int64, segThreads int, dirPath
 					msg := fmt.Sprintf("memtable with id %d does not exist", id)
 					panic(msg)
 				}
-				segment, err := seg.CreateSegment(id, table, storage.dir)
+				segment, err := seg.Create(id, table, storage.dir)
 				if err != nil {
 					panic(err)
 				}
@@ -93,7 +93,7 @@ func NewStorage(maxSegmentSize int64, maxSegments int64, segThreads int, dirPath
 				}
 			}()
 			log.Printf("Compacting segments %d and %d...", segment1.Id, segment2.Id)
-			merged, err = segment1.Merge(segment2, storage.dir)
+			merged, err = segment1.MergeWith(segment2, storage.dir)
 			if err != nil {
 				log.Printf("Error while compacting: %s", err.Error())
 				return
