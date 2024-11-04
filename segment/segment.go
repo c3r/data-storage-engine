@@ -27,7 +27,7 @@ type (
 
 type Segment struct {
 	Id           int64
-	file         *files.File
+	file         files.File
 	headerLength int64
 	index        OffsetIndex
 	wg           sync.WaitGroup
@@ -42,13 +42,18 @@ func Create(id int64, data Data, dir string) (*Segment, error) {
 	var rowNum int
 	var err error
 	var row []byte
-	var file *files.File
+	var file files.File
 	filePath := fmt.Sprintf(dir + "/" + uuid.New().String()) // TODO: handle slash ending
 	if file, err = files.OpenWrite(filePath); err != nil {
 		return nil, err
 	}
-	// defer files.Close(file)
-	s := &Segment{
+	defer func() {
+		if err = files.Close(file); err != nil {
+			log.Printf("Error while closing file %s: %s", filePath, err.Error())
+		}
+
+	}()
+	segment := &Segment{
 		Id:           id,
 		headerLength: int64(0),
 		file:         file,
@@ -74,14 +79,14 @@ func Create(id int64, data Data, dir string) (*Segment, error) {
 	}
 	index_store := func(key string, value int64) {
 		if rowNum%S_LVL == 0 {
-			s.index.Store(key, value)
+			segment.index.Store(key, value)
 		}
 		rowNum++
 	}
-	if err = write_int(s.Id); err != nil {
+	if err = write_int(segment.Id); err != nil {
 		return nil, err
 	}
-	s.headerLength += M_LEN
+	segment.headerLength += M_LEN
 	var order []string
 	data.Range(func(key, value any) bool {
 		order = append(order, key.(string))
@@ -105,7 +110,7 @@ func Create(id int64, data Data, dir string) (*Segment, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s, nil
+	return segment, nil
 }
 
 func (s *Segment) Size() int64 {
@@ -118,14 +123,10 @@ func (segment *Segment) MergeWith(other *Segment, dir string) (*Segment, error) 
 	var err error
 	var it1, it2 int
 	loadRows := func(_segment *Segment) ([]*persistentRow, error) {
-		file, err := files.OpenRead(_segment.file.Path())
-		if err != nil {
-			return nil, err
-		}
 		offset := _segment.headerLength
 		var rows []*persistentRow
 		for offset < _segment.file.Size() {
-			row, bytesRead, err := readRow(file, uint64(offset))
+			row, bytesRead, err := readRow(_segment.file, uint64(offset))
 			if err != nil {
 				return nil, err
 			}
@@ -173,7 +174,7 @@ func LoadPersistedSegments(dir string) ([]*Segment, error) {
 	var segments []*Segment
 	var dirEntries []fs.DirEntry
 	loadSegmentFromFile := func(filePath string) (*Segment, error) {
-		var file *files.File
+		var file files.File
 		var offset int64
 		var bytesRead uint64
 		var row *persistentRow
@@ -195,7 +196,6 @@ func LoadPersistedSegments(dir string) ([]*Segment, error) {
 			segment.index.Store(row.Key, offset) // TODO: sparse table - don't store everything in memory!
 			offset += int64(bytesRead)
 		}
-		// files.Close(file)
 		return segment, nil
 	}
 	if dirEntries, err = os.ReadDir(dir); err != nil {
@@ -246,17 +246,6 @@ func (s *Segment) Load(key string) (string, bool, error) {
 	}
 	s.wg.Add(1)
 	defer s.wg.Done()
-	// Just open the file, we will be reading from it for sure
-	// file, err := files.OpenRead(s.file.Path())
-	// if err != nil {
-	// 	return "", false, err
-	// }
-	defer func() {
-		// fmt.Printf("Closing file %s!\n", s.file.Path())
-		// if err := files.Close(file); err != nil {
-		// 	panic(err)
-		// }
-	}()
 	var stop, offset int64
 	var valueExists bool
 	if offset, valueExists = s.index.Load(key); valueExists {
@@ -278,7 +267,7 @@ func (s *Segment) Load(key string) (string, bool, error) {
 }
 
 // Private
-func readRow(file *files.File, offset uint64) (*persistentRow, uint64, error) {
+func readRow(file files.File, offset uint64) (*persistentRow, uint64, error) {
 	decode := func(bytesFromFile []byte) (*persistentRow, error) {
 		var buf bytes.Buffer
 		var row persistentRow
@@ -302,7 +291,7 @@ func readRow(file *files.File, offset uint64) (*persistentRow, uint64, error) {
 		return nil, 0, err
 	}
 	var dataBytes = make([]byte, dataLen)
-	if err = file.ReadAt(dataBytes, int64(offset+M_LEN)); err != nil {
+	if err = file.ReadAt(&dataBytes, int64(offset+M_LEN)); err != nil {
 		return nil, 0, err
 	}
 	if row, err = decode(dataBytes); err != nil {
@@ -311,10 +300,10 @@ func readRow(file *files.File, offset uint64) (*persistentRow, uint64, error) {
 	return row, uint64(dataLen) + M_LEN, nil
 }
 
-func readField(file *files.File, offset uint64) (int64, error) {
+func readField(file files.File, offset uint64) (int64, error) {
 	var err error
 	var buf = make([]byte, M_LEN)
-	if err = file.ReadAt(buf, int64(offset)); err == nil {
+	if err = file.ReadAt(&buf, int64(offset)); err == nil {
 		return int64(binary.LittleEndian.Uint64(buf)), nil
 	}
 	return 0, err

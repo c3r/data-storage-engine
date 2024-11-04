@@ -5,13 +5,34 @@ import (
 	"os"
 )
 
-var fileSystem = osFiles()
+type FileSystem interface {
+	OpenFile(string) (File, error)
+	CreateFile(string) (File, error)
+	DeleteFile(File) error
+	FileDoesNotExistError() error
+}
 
-func OpenWrite(filePath string) (*File, error) {
-	file, err := fileSystem.openFile(filePath)
+type File interface {
+	Path() string
+	Size() int64
+	Append([]byte) error
+	Sync() error
+	Close() error
+	ReadAt(*[]byte, int64) error
+}
+
+var (
+	osfs osFileSystem
+	mfs  memFileSystem
+)
+
+var fs = mfs
+
+func OpenWrite(filePath string) (File, error) {
+	file, err := fs.OpenFile(filePath)
 	if err != nil {
-		if errors.Is(err, fileSystem.FileDoesNotExistError) {
-			file, err = fileSystem.createFile(filePath)
+		if errors.Is(err, fs.FileDoesNotExistError()) {
+			file, err = fs.CreateFile(filePath)
 			if err != nil {
 				return nil, err
 			}
@@ -22,23 +43,23 @@ func OpenWrite(filePath string) (*File, error) {
 	return file, nil
 }
 
-func OpenRead(filePath string) (*File, error) {
-	if file, err := fileSystem.openFile(filePath); err == nil {
+func OpenRead(filePath string) (File, error) {
+	if file, err := fs.OpenFile(filePath); err == nil {
 		return file, nil
 	} else {
 		return nil, err
 	}
 }
 
-func Close(file *File) error {
+func Close(file File) error {
 	if err := file.Sync(); err != nil {
 		return err
 	}
 	return file.Close()
 }
 
-func Delete(file *File) error {
-	if err := fileSystem.deleteFile(file.Path()); err != nil && !errors.Is(err, os.ErrNotExist) {
+func Delete(file File) error {
+	if err := fs.DeleteFile(file); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil

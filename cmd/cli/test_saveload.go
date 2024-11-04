@@ -34,7 +34,7 @@ func remove(slice []string, s int) []string {
 	return append(slice[:s], slice[s+1:]...)
 }
 
-func client(clientId string, storage *storage.Storage, size int32, wg *sync.WaitGroup) {
+func client(clientId string, storage *storage.Storage, size int32, wg *sync.WaitGroup, minutes int) {
 	defer wg.Done()
 	logger := log.Default()
 
@@ -59,7 +59,7 @@ func client(clientId string, storage *storage.Storage, size int32, wg *sync.Wait
 
 	clientStart := time.Now()
 	for {
-		if time.Since(clientStart).Minutes() > 5 {
+		if time.Since(clientStart).Minutes() > float64(minutes) {
 			break
 		}
 		// Sleep for a random time
@@ -116,6 +116,7 @@ func main() {
 	segmentThreads := 2
 	clients := 200
 	segmentsDir := "/tmp/tb_storage"
+	minutes := 5
 
 	storage := storage.NewStorage(int64(maxSegmentsSize), int64(maxSegments), segmentThreads, segmentsDir, 5)
 	wg := &sync.WaitGroup{}
@@ -124,7 +125,7 @@ func main() {
 		id := strconv.Itoa(i)
 		wg.Add(1)
 		size := 2 + rand.Int32N(5)
-		go client(id, storage, size, wg)
+		go client(id, storage, size, wg, minutes)
 	}
 	wg.Wait()
 	elapsed := time.Since(start)
