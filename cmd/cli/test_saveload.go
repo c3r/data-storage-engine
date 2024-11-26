@@ -111,7 +111,7 @@ func client(clientId string, storage *storage.Storage, size int32, wg *sync.Wait
 
 func main() {
 	logger := log.Default()
-	maxSegmentsSize := 1024 * 20
+	maxSegmentsSize := 1024 * 2
 	maxSegments := 1024
 	segmentThreads := 2
 	clients := 200

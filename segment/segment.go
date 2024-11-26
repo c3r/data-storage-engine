@@ -225,17 +225,16 @@ func (s *Segment) Load(key string) (string, bool, error) {
 		var startKey, stopKey string
 		var start, stop int64
 		var valueExists bool
-		s.index.ForKeys(func(_key string) bool {
+		for _key := range s.index.ForKeys {
 			if dataKey > _key {
 				startKey = _key
-				return true
+				continue
 			}
 			if dataKey < _key {
 				stopKey = _key
-				return false
+				break
 			}
-			return true
-		})
+		}
 		if start, valueExists = s.index.Load(startKey); !valueExists {
 			start = s.headerLength
 		}

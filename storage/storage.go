@@ -68,6 +68,7 @@ func NewStorage(maxSegmentSize int64, maxSegments int64, segThreads int, dirPath
 					msg := fmt.Sprintf("memtable with id %d does not exist", id)
 					panic(msg)
 				}
+
 				segment, err := seg.Create(id, table, storage.dir)
 				if err != nil {
 					panic(err)
@@ -112,27 +113,26 @@ func NewStorage(maxSegmentSize int64, maxSegments int64, segThreads int, dirPath
 				continue
 			}
 			firstId = -1
-			storage.segments.ForValues(func(segment *seg.Segment) bool {
+			for segment := range storage.segments.ForValues {
 				if segment.Id == firstId {
-					return true
+					continue
 				}
 				if firstId == -1 {
 					firstId = segment.Id
-					return true
+					continue
 				}
 				if otherSegment, valueExists = storage.segments.Load(firstId); !valueExists {
 					log.Printf("Error while compacting: segment %d does not exist", firstId)
-					return true
+					continue
 				}
 				if segment.Size() != otherSegment.Size() {
 					log.Printf("%d and %d are different sizes (%d != %d)", segment.Id, otherSegment.Id, segment.Size(), otherSegment.Size())
 					firstId = segment.Id
-					return true
+					continue
 				}
 				compact_segments(otherSegment, segment)
 				firstId = -1
-				return true
-			})
+			}
 		}
 	}()
 
@@ -166,24 +166,20 @@ func (storage *Storage) Save(key string, value string) error {
 }
 
 func (storage *Storage) Load(key string) (string, error, bool) {
-	var value any
-	var valueExists bool
-	var err error
-	storage.memtables.ForValues(func(table Memtable) bool {
-		value, valueExists = table.Load(key)
-		return !valueExists
-	})
-	if valueExists {
-		return value.(string), nil, true
+	for table := range storage.memtables.ForValues {
+		value, valueExists := table.Load(key)
+		if valueExists {
+			return value.(string), nil, true
+		}
 	}
-	storage.segments.ForValuesReverse(func(segment *seg.Segment) bool {
-		value, valueExists, err = segment.Load(key)
-		return err == nil && !valueExists
-	})
-	if err != nil {
-		return "", err, false
-	} else if !valueExists {
-		return value.(string), fmt.Errorf("value not found for %s", key), false
+	for segment := range storage.segments.Reverse {
+		value, valueExists, err := segment.Load(key)
+		if err != nil {
+			return "", err, false
+		}
+		if valueExists {
+			return value, nil, false
+		}
 	}
-	return value.(string), nil, false
+	return "", fmt.Errorf("value not found for %s", key), false
 }

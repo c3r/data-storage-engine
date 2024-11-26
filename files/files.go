@@ -26,7 +26,7 @@ var (
 	mfs  memFileSystem
 )
 
-var fs = mfs
+var fs = osfs
 
 func OpenWrite(filePath string) (File, error) {
 	file, err := fs.OpenFile(filePath)

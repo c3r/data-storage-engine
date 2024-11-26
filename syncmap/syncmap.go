@@ -74,18 +74,6 @@ func (s *Ordered[K, V]) deleteOrder(k K) {
 	}
 }
 
-func (s *Ordered[K, V]) ForRange(f func(k K, v V) bool) {
-	for _, k := range s.order {
-		v, valueExists := s.data.Load(k)
-		if !valueExists {
-			continue
-		}
-		if !f(k, v.(V)) {
-			break
-		}
-	}
-}
-
 func (s *Ordered[K, V]) ForKeys(f func(k K) bool) {
 	for _, k := range s.order {
 		if !f(k) {
@@ -106,15 +94,15 @@ func (s *Ordered[K, V]) ForValues(f func(v V) bool) {
 	}
 }
 
-func (s *Ordered[K, V]) ForValuesReverse(f func(value V) bool) {
-	for i := len(s.order) - 1; i >= 0; i-- {
-		k := s.order[i]
-		v, valueExists := s.data.Load(k)
-		if !valueExists {
+func (s *Ordered[K, V]) Reverse(f func(value V) bool) {
+	for i := range slices.Backward(s.order) {
+		key := s.order[i]
+		value, ok := s.data.Load(key)
+		if !ok {
 			continue
 		}
-		if !f(v.(V)) {
-			break
+		if !f(value.(V)) {
+			return
 		}
 	}
 }
